@@ -1,0 +1,72 @@
+# ── 全局配置 ─────────────────────────────────────────────────────
+universe:
+  # A股：从沪深300成分股抓取；设为 [] 则扫描全量（较慢）
+  a_share_index: "000300"   # 000300=沪深300, 000905=中证500
+  a_share_limit: 100        # 最多取前 N 只 A 股（调试期间缩小范围）
+  # 美股：标普500成分股
+  us_market: true
+  us_stock_list:            # 为空则自动从 Wikipedia 获取标普500列表
+    - AAPL
+    - MSFT
+    - GOOGL
+    - AMZN
+    - NVDA
+    - META
+    - TSLA
+    - JPM
+    - V
+    - UNH
+
+data:
+  lookback_days: 120        # 计算指标所需历史天数
+  cache_dir: "data/cache"   # 本地缓存目录
+  cache_ttl_hours: 12       # 缓存有效期（小时）
+
+# ── 技术指标参数 ─────────────────────────────────────────────────
+indicators:
+  ma_periods: [5, 10, 20, 60]
+  ema_periods: [12, 26]
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  rsi_period: 14
+  bbands:
+    period: 20
+    std: 2.0
+  atr_period: 14
+  volume_ma_period: 20
+
+# ── 选股评分权重 ─────────────────────────────────────────────────
+scoring:
+  weights:
+    trend: 0.30       # MA 排列
+    momentum: 0.30    # MACD + RSI
+    volume: 0.20      # 量价配合
+    volatility: 0.20  # 布林带 + ATR
+  top_n: 10           # 每次选出 Top N 只
+
+# ── 组合管理 ─────────────────────────────────────────────────────
+portfolio:
+  initial_capital: 1000000.0   # 初始资金（人民币，美股按汇率换算）
+  usd_cny_rate: 7.2            # 美元兑人民币（固定汇率，仅模拟用）
+  max_positions: 20            # 最大持仓数量
+  position_size_pct: 0.05      # 单只股票最大仓位比例（5%）
+  commission_rate: 0.0003      # 佣金率（A股）
+  us_commission_per_share: 0.005  # 美股每股佣金（USD）
+  min_commission: 1.0          # 最低佣金（USD）
+
+# ── 风险控制 ─────────────────────────────────────────────────────
+risk:
+  stop_loss_pct: 0.05          # 固定止损：亏损 5% 即止损
+  trailing_stop_pct: 0.08      # 追踪止损：从最高点回撤 8% 止损
+  max_hold_days: 30            # 最长持仓天数
+  max_portfolio_drawdown: 0.15 # 组合最大回撤（达到则停止新建仓）
+
+# ── 调度器 ───────────────────────────────────────────────────────
+scheduler:
+  # A股：每个交易日 16:00 收盘后运行
+  a_share_cron: "0 16 * * 1-5"
+  # 美股：每个交易日 22:00（北京时间，美东盘后）运行
+  us_stock_cron: "0 22 * * 1-5"
+  timezone: "Asia/Shanghai"
