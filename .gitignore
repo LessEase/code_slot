@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Data (generated at runtime)
+data/cache/
+data/history/
+data/models/
+data/ml/
+data/backtest/
+data/portfolio.db
+
+# Env
+.env
+.venv/
+venv/
