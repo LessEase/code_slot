@@ -70,3 +70,36 @@ scheduler:
   # 美股：每个交易日 22:00（北京时间，美东盘后）运行
   us_stock_cron: "0 22 * * 1-5"
   timezone: "Asia/Shanghai"
+
+# ── ML Pipeline ──────────────────────────────────────────────────
+ml_pipeline:
+  # ── 数据 ──────────────────────────────────────────────────────
+  history_years: 3            # 历史数据年数（用于训练）
+  history_dir: "data/history" # 历史 OHLCV 存储目录
+  model_dir: "data/models"    # 模型存储目录
+
+  # ── 样本标签 ──────────────────────────────────────────────────
+  forward_days: 5             # 预测 N 天后的涨跌
+  return_threshold: 0.03      # 标签=1 的条件：N天涨幅 > 3%
+
+  # ── 训练方案 ──────────────────────────────────────────────────
+  train_years: 2.0            # walk-forward 训练窗口（年）
+  test_months: 3              # walk-forward 测试窗口（月）
+
+  # ── LightGBM 超参 ─────────────────────────────────────────────
+  lgbm:
+    n_estimators: 500
+    learning_rate: 0.05
+    num_leaves: 31
+    max_depth: 6
+    min_child_samples: 50
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    early_stopping_rounds: 50
+
+  # ── 回测 ──────────────────────────────────────────────────────
+  rebalance_days: 5           # 每 N 个交易日调仓一次
+  top_n: 10                   # 每次选出 Top N 只
+  min_hold_days: 2            # 最少持仓天数（避免频繁换手）

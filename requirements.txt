@@ -9,3 +9,7 @@ PyYAML>=6.0
 rich>=13.0.0
 pyarrow>=12.0.0
 requests>=2.31.0
+# ML pipeline
+lightgbm>=4.0.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
