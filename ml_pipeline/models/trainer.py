@@ -18,7 +18,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import lightgbm as lgb
+from ml_pipeline._lgbm import lgb
 from sklearn.metrics import (
     roc_auc_score, average_precision_score,
     log_loss, accuracy_score,

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import lightgbm as lgb
+from ml_pipeline._lgbm import lgb
 import pandas as pd
 
 from stock_trading.utils.logger import get_logger

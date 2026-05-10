@@ -22,11 +22,11 @@ from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import lightgbm as lgb
 from rich.console import Console
 from rich.table import Table
 from rich import box
 
+from ml_pipeline._lgbm import lgb
 from ml_pipeline.features.engineer import FEATURE_COLS
 from ml_pipeline.backtest.metrics import compute_all
 from stock_trading.utils.logger import get_logger
