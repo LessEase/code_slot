@@ -103,3 +103,9 @@ ml_pipeline:
   rebalance_days: 5           # 每 N 个交易日调仓一次
   top_n: 10                   # 每次选出 Top N 只
   min_hold_days: 2            # 最少持仓天数（避免频繁换手）
+
+  # ── 真实化（避免 in-sample 偏差和零滑点）─────────────────────
+  backtest_holdout_months: 12 # 训练时排除最近 N 个月作为严格 OOS 回测窗口
+  execution_lag_days: 1       # 信号在 t 日产生，t+lag 个交易日的收盘价成交
+  slippage_bps: 10            # 单边滑点（基点），10 bps = 0.10%
+  a_share_price_limit: 0.095  # A 股涨跌幅 ≥ 此值视为封板，当日不可成交

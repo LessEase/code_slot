@@ -2,17 +2,30 @@
 
 Simulates a rebalancing strategy driven by model probability scores:
 
-  Every `rebalance_days` trading days:
-    1. Score all stocks with the trained LightGBM model
-    2. Select top-N by predicted probability
-    3. Close positions not in the new selection (if hold period ≥ min_hold)
-    4. Open new positions for newly selected stocks
+  On signal day t (every `rebalance_days` trading days):
+    1. Score every stock with the trained LightGBM model using features
+       known at the close of day t.
+    2. Select top-N by predicted probability — this becomes the *pending*
+       target portfolio.
 
-The engine uses a lightweight in-memory portfolio (no SQLite) for speed.
-Results include an equity curve, per-trade log, and full metrics report.
+  On execution day t + `execution_lag_days`:
+    3. Sell positions not in the pending target (subject to A-share T+1
+       and min-hold constraints, skipping limit-down names that can't fill).
+    4. Buy positions newly in the target (skipping A-share limit-up names).
+    5. Fills are at that day's close, adjusted by `slippage_bps`.
 
-No look-ahead bias: on day t the model only sees features up to day t.
-The next-day open is used as execution price (realistic fill assumption).
+Realism guards (the previous version did none of these):
+  - Signal/execution lag prevents using the same close that produced the
+    signal as the fill price.
+  - Per-fill slippage in basis points.
+  - A-share daily price-limit filter (no fills when ret_1d ≥ +limit on
+    the buy side or ≤ -limit on the sell side).
+  - A-share T+1: a position bought today can be sold no earlier than the
+    next trading day.
+
+For honest numbers the deployment model must have been trained with a
+holdout, and the backtest start date should be after that train cutoff.
+``pipeline.step_backtest`` enforces this automatically.
 """
 
 import numpy as np
@@ -53,6 +66,7 @@ class _BacktestPortfolio:
     commission_rate: float = 0.0003
     us_commission_per_share: float = 0.005
     usd_cny: float = 7.2
+    slippage_bps: float = 0.0      # one-sided, in basis points (10 = 0.10%)
 
     cash: float = field(init=False)
     positions: Dict[str, _Position] = field(default_factory=dict, init=False)
@@ -71,14 +85,19 @@ class _BacktestPortfolio:
     def _price_cny(self, market: str, price: float) -> float:
         return price * self.usd_cny if market == "US" else price
 
+    def _apply_slippage(self, price: float, side: str) -> float:
+        slip = self.slippage_bps / 10000.0
+        return price * (1.0 + slip) if side == "BUY" else price * (1.0 - slip)
+
     def buy(self, symbol: str, market: str, price: float,
             trade_date: date, score: float, max_pos_pct: float) -> bool:
         if symbol in self.positions:
             return False
+        fill_price = self._apply_slippage(price, "BUY")
         equity = self.total_equity({})
         target_value = equity * max_pos_pct
         available = min(target_value, self.cash * 0.95)
-        price_cny = self._price_cny(market, price)
+        price_cny = self._price_cny(market, fill_price)
         if price_cny <= 0 or available < price_cny:
             return False
         shares = available / price_cny
@@ -109,7 +128,8 @@ class _BacktestPortfolio:
         pos = self.positions.pop(symbol, None)
         if pos is None:
             return False
-        price_cny = self._price_cny(pos.market, price)
+        fill_price = self._apply_slippage(price, "SELL")
+        price_cny = self._price_cny(pos.market, fill_price)
         proceeds = pos.shares * price_cny
         commission = self._commission(pos.market, pos.shares, price_cny)
         net = proceeds - commission
@@ -170,9 +190,14 @@ class BacktestEngine:
         self.feature_names = meta["feature_names"]
         self.feature_data = feature_data
         self.market_map = market_map
-        self.rebalance_days = cfg["ml_pipeline"]["rebalance_days"]
-        self.top_n = cfg["ml_pipeline"]["top_n"]
-        self.min_hold_days = cfg["ml_pipeline"].get("min_hold_days", 2)
+        ml = cfg["ml_pipeline"]
+        self.rebalance_days = ml["rebalance_days"]
+        self.top_n = ml["top_n"]
+        self.min_hold_days = ml.get("min_hold_days", 2)
+        self.execution_lag_days = max(1, int(ml.get("execution_lag_days", 1)))
+        self.slippage_bps = float(ml.get("slippage_bps", 0.0))
+        self.a_share_price_limit = float(ml.get("a_share_price_limit", 0.095))
+        self._a_limit_log_ret = float(np.log1p(self.a_share_price_limit))
         self.max_pos_pct = cfg["portfolio"]["position_size_pct"]
         self.initial_capital = cfg["portfolio"]["initial_capital"]
         self.usd_cny = cfg["portfolio"]["usd_cny_rate"]
@@ -213,6 +238,37 @@ class BacktestEngine:
         row = df.loc[available[0]]
         return float(row["close"]) if "close" in row.index else None
 
+    def _hits_price_limit(self, symbol: str, dt: pd.Timestamp, side: str) -> bool:
+        """Return True if symbol is at A-share daily limit on day dt and so
+        cannot be filled on the requested side. US tickers are never blocked.
+
+        Approximation: we only have end-of-day data, so we treat ``ret_1d``
+        (log return today vs. yesterday's close) >= +limit as "limit-up"
+        and <= -limit as "limit-down". This filters out the bulk of
+        unfillable A-share names.
+        """
+        if self.market_map.get(symbol) != "A":
+            return False
+        df = self.feature_data.get(symbol)
+        if df is None or dt not in df.index:
+            return False
+        ret = df.loc[dt].get("ret_1d")
+        if ret is None or pd.isna(ret):
+            return False
+        ret = float(ret)
+        if side == "BUY":
+            return ret >= self._a_limit_log_ret
+        return ret <= -self._a_limit_log_ret
+
+    def _can_sell_today(self, pos: _Position, dt: pd.Timestamp) -> bool:
+        """A-share T+1: buy day cannot also be sell day. Plus min_hold_days."""
+        days_held = (dt.date() - pos.entry_date).days
+        if days_held < self.min_hold_days:
+            return False
+        if pos.market == "A" and pos.entry_date >= dt.date():
+            return False
+        return True
+
     def run(
         self,
         start: str,
@@ -228,6 +284,7 @@ class BacktestEngine:
         portfolio = _BacktestPortfolio(
             initial_cash=self.initial_capital,
             usd_cny=self.usd_cny,
+            slippage_bps=self.slippage_bps,
         )
         trading_dates = self._all_trading_dates(start, end)
         if len(trading_dates) == 0:
@@ -236,12 +293,53 @@ class BacktestEngine:
         log.info(
             f"Backtest {start} → {end}  "
             f"({len(trading_dates)} trading days, "
-            f"rebalance every {self.rebalance_days}d, top-{self.top_n})"
+            f"rebalance every {self.rebalance_days}d, top-{self.top_n}, "
+            f"exec_lag={self.execution_lag_days}d, slip={self.slippage_bps:.0f}bps)"
         )
 
         rebalance_counter = 0
+        # Pending signal generated on a prior signal day, executed `lag` days later.
+        # Tuple: (target_symbols, scores, signal_index_in_trading_dates)
+        pending: Optional[Tuple[set, pd.Series, int]] = None
+        skipped_limit_up = 0
+        skipped_limit_down = 0
+
         for i, dt in enumerate(trading_dates):
-            # Collect current prices for equity snapshot
+            # ── 1) Execute any pending order at TODAY's close ─────────────
+            if pending is not None and (i - pending[2]) >= self.execution_lag_days:
+                target_symbols, scores, _ = pending
+                # Sells first (frees cash for buys)
+                for sym in list(portfolio.positions.keys()):
+                    if sym in target_symbols:
+                        continue
+                    pos = portfolio.positions[sym]
+                    if not self._can_sell_today(pos, dt):
+                        continue
+                    if self._hits_price_limit(sym, dt, "SELL"):
+                        skipped_limit_down += 1
+                        continue
+                    price = self._get_price(sym, dt)
+                    if price is not None:
+                        portfolio.sell(sym, price, dt.date(), reason="rebalance")
+
+                # Then buys
+                for sym in scores.head(self.top_n).index:
+                    if sym in portfolio.positions:
+                        continue
+                    if self._hits_price_limit(sym, dt, "BUY"):
+                        skipped_limit_up += 1
+                        continue
+                    price = self._get_price(sym, dt)
+                    if price is None:
+                        continue
+                    portfolio.buy(
+                        sym, self.market_map.get(sym, "A"), price, dt.date(),
+                        score=float(scores[sym]),
+                        max_pos_pct=self.max_pos_pct,
+                    )
+                pending = None
+
+            # ── 2) Mark-to-market snapshot at today's close (post-trade) ──
             prices = {
                 sym: self._get_price(sym, dt)
                 for sym in portfolio.positions
@@ -249,44 +347,35 @@ class BacktestEngine:
             prices = {k: v for k, v in prices.items() if v is not None}
             portfolio.snapshot(dt.date(), prices)
 
-            # Rebalance on schedule
+            # ── 3) Generate signal on schedule (executes on i + lag) ──────
             if i % self.rebalance_days != 0:
                 continue
-            rebalance_counter += 1
-
+            # Don't bother generating a signal we won't have time to execute.
+            if i + self.execution_lag_days >= len(trading_dates):
+                continue
             scores = self._score_stocks(dt)
             if scores.empty:
                 continue
-            top_symbols = set(scores.head(self.top_n).index.tolist())
+            rebalance_counter += 1
+            pending = (
+                set(scores.head(self.top_n).index.tolist()),
+                scores,
+                i,
+            )
 
-            # Close positions not in top selection (respecting min hold)
-            for sym in list(portfolio.positions.keys()):
-                if sym not in top_symbols:
-                    pos = portfolio.positions[sym]
-                    hold = (dt.date() - pos.entry_date).days
-                    if hold >= self.min_hold_days:
-                        price = self._get_price(sym, dt)
-                        if price is not None:
-                            portfolio.sell(sym, price, dt.date(), reason="rebalance")
-
-            # Open new positions
-            for sym in scores.head(self.top_n).index:
-                if sym not in portfolio.positions:
-                    price = self._get_price(sym, dt)
-                    mkt = self.market_map.get(sym, "A")
-                    if price is not None:
-                        portfolio.buy(
-                            sym, mkt, price, dt.date(),
-                            score=float(scores[sym]),
-                            max_pos_pct=self.max_pos_pct,
-                        )
-
-        # Close all remaining positions on last day
+        # Close all remaining positions on the last day at its close (no lag,
+        # this is a forced liquidation at end of backtest, not a strategy fill).
         last_dt = trading_dates[-1]
         for sym in list(portfolio.positions.keys()):
             price = self._get_price(sym, last_dt)
             if price is not None:
                 portfolio.sell(sym, price, last_dt.date(), reason="end_of_backtest")
+
+        if skipped_limit_up or skipped_limit_down:
+            log.info(
+                f"Skipped fills due to A-share price limits: "
+                f"{skipped_limit_up} limit-up (buy), {skipped_limit_down} limit-down (sell)"
+            )
 
         equity = portfolio.equity_series()
         trades = portfolio.trade_df()

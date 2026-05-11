@@ -124,11 +124,18 @@ def step_samples(cfg: dict) -> Dict[str, pd.DataFrame]:
 
 
 def step_train(cfg: dict) -> None:
-    """Train models with walk-forward CV and save to registry."""
+    """Train models with walk-forward CV and save to registry.
+
+    The deployment model is trained only on samples up to
+    ``max_date - backtest_holdout_months``; the tail is reserved as a
+    strictly out-of-sample window for ``step_backtest``. This is the
+    single most important change for honest backtest numbers.
+    """
     log.info("═══ Step 4/5: Model Training ═══")
     generator = SampleGenerator(cfg)
     trainer = ModelTrainer(cfg)
     registry = ModelRegistry(cfg["ml_pipeline"].get("model_dir", "data/models"))
+    holdout_months = int(cfg["ml_pipeline"].get("backtest_holdout_months", 12))
 
     for market in MARKETS:
         try:
@@ -141,8 +148,17 @@ def step_train(cfg: dict) -> None:
             log.warning(f"Too few samples for {market} ({len(samples)}), skipping")
             continue
 
-        log.info(f"Training {market} model on {len(samples):,} samples …")
-        fold_results, final_model = trainer.walk_forward_cv(samples)
+        if not isinstance(samples.index, pd.DatetimeIndex):
+            samples = samples.set_index("date")
+        train_end = samples.index.max() - pd.DateOffset(months=holdout_months)
+
+        log.info(
+            f"Training {market} model on {len(samples):,} samples "
+            f"(train ≤ {train_end.date()}, OOS holdout = last {holdout_months}mo) …"
+        )
+        fold_results, final_model, effective_train_end = trainer.walk_forward_cv(
+            samples, train_end_date=train_end,
+        )
 
         available_features = [c for c in FEATURE_COLS if c in samples.columns]
         fi = trainer.get_feature_importance(final_model, available_features)
@@ -153,11 +169,13 @@ def step_train(cfg: dict) -> None:
             feature_names=available_features,
             fold_results=fold_results,
             feature_importance=fi,
+            train_end_date=effective_train_end.strftime("%Y-%m-%d"),
             cfg_snapshot={
                 "forward_days": cfg["ml_pipeline"]["forward_days"],
                 "return_threshold": cfg["ml_pipeline"]["return_threshold"],
                 "train_years": cfg["ml_pipeline"]["train_years"],
                 "test_months": cfg["ml_pipeline"]["test_months"],
+                "backtest_holdout_months": holdout_months,
             },
         )
         _print_fold_summary(fold_results, market)
@@ -221,10 +239,25 @@ def step_backtest(cfg: dict, market: Optional[str] = None) -> None:
             log.warning(f"No feature data for {mkt}")
             continue
 
-        # Backtest on the most recent test_months * 4 period
-        test_months = cfg["ml_pipeline"]["test_months"] * 4
-        end = datetime.today().strftime("%Y-%m-%d")
-        start = (datetime.today() - timedelta(days=test_months * 30)).strftime("%Y-%m-%d")
+        # Backtest strictly OUT of the training window. The model meta records
+        # the last sample date the deployment model saw; we start the backtest
+        # one day after it. Falling back to the legacy "recent N months" only
+        # for older models that pre-date this change.
+        last_feature_date = max(df.index.max() for df in features.values())
+        end = pd.Timestamp(last_feature_date).strftime("%Y-%m-%d")
+        train_end_str = meta.get("train_end_date")
+        if train_end_str:
+            start = (pd.Timestamp(train_end_str) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            log.info(f"OOS backtest window for {mkt}: {start} → {end} "
+                     f"(model train_end={train_end_str})")
+        else:
+            test_months = cfg["ml_pipeline"]["test_months"] * 4
+            end = datetime.today().strftime("%Y-%m-%d")
+            start = (datetime.today() - timedelta(days=test_months * 30)).strftime("%Y-%m-%d")
+            log.warning(
+                f"Model meta has no train_end_date — falling back to legacy "
+                f"window {start} → {end}. Re-run --train to get an honest OOS backtest."
+            )
 
         market_map = {sym: mkt for sym in features}
 
