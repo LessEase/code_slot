@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import lightgbm as lgb
+from ml_pipeline._lgbm import lgb
 import pandas as pd
 
 from stock_trading.utils.logger import get_logger
@@ -42,8 +42,14 @@ class ModelRegistry:
         fold_results: List[Dict],
         feature_importance: Optional[pd.DataFrame] = None,
         cfg_snapshot: Optional[dict] = None,
+        train_end_date: Optional[str] = None,
     ) -> Path:
-        """Persist a trained model and its metadata."""
+        """Persist a trained model and its metadata.
+
+        ``train_end_date`` is the ISO date string of the last sample the
+        deployment model was trained on. Backtests must start strictly
+        after this date to remain out-of-sample.
+        """
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_dir = self._market_dir(market) / ts
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +65,7 @@ class ModelRegistry:
             "feature_names": feature_names,
             "n_trees": model.num_trees(),
             "fold_results": fold_results,
+            "train_end_date": train_end_date,
             "config": cfg_snapshot or {},
         }
         with open(model_dir / "meta.json", "w") as f:

@@ -16,8 +16,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
 
+from ml_pipeline._lgbm import lgb
 from ml_pipeline.data.collector import HistoricalCollector
 from ml_pipeline.features.engineer import build_feature_matrix, FEATURE_COLS
 from ml_pipeline.models.registry import ModelRegistry

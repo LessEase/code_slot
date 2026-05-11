@@ -18,7 +18,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import lightgbm as lgb
+from ml_pipeline._lgbm import lgb
 from sklearn.metrics import (
     roc_auc_score, average_precision_score,
     log_loss, accuracy_score,
@@ -123,14 +123,24 @@ class ModelTrainer:
     def walk_forward_cv(
         self,
         samples: pd.DataFrame,
-    ) -> Tuple[List[Dict], lgb.Booster]:
+        train_end_date: Optional[pd.Timestamp] = None,
+    ) -> Tuple[List[Dict], lgb.Booster, pd.Timestamp]:
         """
         Walk-forward cross-validation.
+
+        Parameters
+        ----------
+        samples : combined sample DataFrame (DatetimeIndex)
+        train_end_date : if provided, the final deployment model is trained
+            ONLY on samples whose index <= train_end_date. Everything after
+            is left as a strictly out-of-sample window for backtesting.
 
         Returns
         -------
         fold_results : list of per-fold metric dicts
-        final_model  : model trained on ALL data (for deployment)
+        final_model  : LightGBM booster trained on samples ≤ train_end_date
+        effective_train_end : the actual cutoff used (max sample date if no
+            holdout was requested)
         """
         splits = SampleGenerator.walk_forward_splits(
             samples, self.train_years, self.test_months
@@ -163,15 +173,35 @@ class ModelTrainer:
                 f"n_train={metrics['n_train']:,}  n_test={metrics['n_test']:,}"
             )
 
-        # Final model: train on all data (no early stopping)
-        log.info("Training final model on full dataset …")
-        X_all, y_all = _xy(samples)
+        # Final model: train on samples up to (and including) train_end_date.
+        # Anything after this cutoff is reserved as the strictly out-of-sample
+        # window that step_backtest will run on, so the deployment model never
+        # sees the backtest period.
+        if not isinstance(samples.index, pd.DatetimeIndex):
+            raise ValueError("samples must have a DatetimeIndex")
+
+        max_date = samples.index.max()
+        cutoff = pd.Timestamp(train_end_date) if train_end_date is not None else max_date
+        cutoff = min(cutoff, max_date)
+        train_samples = samples[samples.index <= cutoff]
+        if train_samples.empty:
+            raise ValueError(
+                f"No samples available with index <= {cutoff.date()}; "
+                f"reduce backtest_holdout_months or collect more history."
+            )
+
+        held_out = len(samples) - len(train_samples)
+        log.info(
+            f"Training final model on samples ≤ {cutoff.date()}  "
+            f"({len(train_samples):,} rows, holding out {held_out:,} for backtest) …"
+        )
+        X_all, y_all = _xy(train_samples)
         final_model = self._train_one(X_all, y_all)
         log.info(f"Final model: {final_model.num_trees()} trees, "
-                 f"{len(X_all):,} training samples")
+                 f"{len(X_all):,} training samples, train_end={cutoff.date()}")
 
         self._log_feature_importance(final_model, X_all.columns.tolist())
-        return fold_results, final_model
+        return fold_results, final_model, cutoff
 
     # ── Feature importance ─────────────────────────────────────────────────
 

@@ -35,10 +35,6 @@ from stock_trading.trading.simulator import TradingSimulator
 from stock_trading.scheduler.job import start_scheduler
 from stock_trading.portfolio.portfolio import Portfolio
 from stock_trading.utils.logger import get_logger
-from ml_pipeline.pipeline import (
-    step_collect, step_features, step_samples,
-    step_train, step_backtest, run_full_pipeline,
-)
 
 log = get_logger("main")
 console = Console()
@@ -134,17 +130,25 @@ def main() -> None:
     cfg = load_config(args.config)
 
     # ── ML pipeline steps ──────────────────────────────────────────────────
+    # Imported lazily so that trading commands keep working even when the
+    # ML stack (e.g. lightgbm / libomp on macOS) fails to load.
     if args.pipeline:
+        from ml_pipeline.pipeline import run_full_pipeline
         run_full_pipeline(cfg)
     elif args.collect:
+        from ml_pipeline.pipeline import step_collect
         step_collect(cfg)
     elif args.features:
+        from ml_pipeline.pipeline import step_features
         step_features(cfg)
     elif args.samples:
+        from ml_pipeline.pipeline import step_samples
         step_samples(cfg)
     elif args.train:
+        from ml_pipeline.pipeline import step_train
         step_train(cfg)
     elif args.backtest:
+        from ml_pipeline.pipeline import step_backtest
         step_backtest(cfg, market=args.market)
 
     # ── Trading commands ───────────────────────────────────────────────────
