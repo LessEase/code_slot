@@ -150,11 +150,19 @@ def step_train(cfg: dict) -> None:
 
         if not isinstance(samples.index, pd.DatetimeIndex):
             samples = samples.set_index("date")
-        train_end = samples.index.max() - pd.DateOffset(months=holdout_months)
+
+        # The label at row t uses close[t + forward_days]. To ensure NO data
+        # from the OOS window leaks into training labels, we shift the cutoff
+        # back by an extra forward_days padding (× 2 for calendar→trading
+        # day buffer + weekend rollover).
+        forward_days = int(cfg["ml_pipeline"]["forward_days"])
+        label_pad = pd.Timedelta(days=forward_days * 2)
+        train_end = samples.index.max() - pd.DateOffset(months=holdout_months) - label_pad
 
         log.info(
             f"Training {market} model on {len(samples):,} samples "
-            f"(train ≤ {train_end.date()}, OOS holdout = last {holdout_months}mo) …"
+            f"(train ≤ {train_end.date()}, OOS holdout ≈ last {holdout_months}mo, "
+            f"label_pad={forward_days*2}d) …"
         )
         fold_results, final_model, effective_train_end = trainer.walk_forward_cv(
             samples, train_end_date=train_end,
@@ -222,6 +230,12 @@ def _print_fold_summary(fold_results, market: str) -> None:
 def step_backtest(cfg: dict, market: Optional[str] = None) -> None:
     """Run backtest using trained model on historical data."""
     log.info("═══ Step 5/5: Backtest ═══")
+    log.warning(
+        "⚠ Survivorship bias: the universe is today's CSI300/S&P500 constituents — "
+        "delisted or demoted names are absent, so backtest returns are biased upward. "
+        "Compare 'α vs Universe B&H' (printed below) against pure model α to gauge how "
+        "much is alpha vs survivors-beta."
+    )
     registry = ModelRegistry(cfg["ml_pipeline"].get("model_dir", "data/models"))
     collector = HistoricalCollector(cfg)
 

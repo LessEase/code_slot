@@ -146,9 +146,12 @@ class _BacktestPortfolio:
     def total_equity(self, prices: Dict[str, float]) -> float:
         equity = self.cash
         for sym, pos in self.positions.items():
-            p = prices.get(sym, pos.entry_price)
-            p_cny = self._price_cny(pos.market, p)
-            equity += pos.shares * p_cny
+            p = prices.get(sym)
+            if p is None:
+                # entry_price is already in CNY; do NOT re-apply the USDCNY rate.
+                equity += pos.shares * pos.entry_price
+            else:
+                equity += pos.shares * self._price_cny(pos.market, p)
         return equity
 
     def snapshot(self, dt: date, prices: Dict[str, float]) -> None:
@@ -269,6 +272,25 @@ class BacktestEngine:
             return False
         return True
 
+    def _universe_buy_hold_return(self, trading_dates: pd.DatetimeIndex) -> Tuple[float, int]:
+        """Equal-weighted buy-and-hold return of the entire universe over
+        the backtest window. Diagnostic only — answers "how much of the
+        strategy's return is just beta from a universe that was filtered
+        for survivors?" Returns (mean_return, n_symbols).
+        """
+        if len(trading_dates) < 2:
+            return 0.0, 0
+        start_dt, end_dt = trading_dates[0], trading_dates[-1]
+        rets = []
+        for sym, df in self.feature_data.items():
+            window = df.loc[(df.index >= start_dt) & (df.index <= end_dt), "close"]
+            if len(window) < 2 or window.iloc[0] <= 0:
+                continue
+            rets.append(float(window.iloc[-1] / window.iloc[0] - 1.0))
+        if not rets:
+            return 0.0, 0
+        return float(np.mean(rets)), len(rets)
+
     def run(
         self,
         start: str,
@@ -303,6 +325,9 @@ class BacktestEngine:
         pending: Optional[Tuple[set, pd.Series, int]] = None
         skipped_limit_up = 0
         skipped_limit_down = 0
+        # Diagnostics: collect the mean predicted probability of the top-N
+        # picks across all rebalances, to spot suspiciously confident models.
+        topn_prob_means: List[float] = []
 
         for i, dt in enumerate(trading_dates):
             # ── 1) Execute any pending order at TODAY's close ─────────────
@@ -357,6 +382,7 @@ class BacktestEngine:
             if scores.empty:
                 continue
             rebalance_counter += 1
+            topn_prob_means.append(float(scores.head(self.top_n).mean()))
             pending = (
                 set(scores.head(self.top_n).index.tolist()),
                 scores,
@@ -382,6 +408,16 @@ class BacktestEngine:
         metrics = compute_all(equity, trades, benchmark_series)
         metrics["rebalances"] = rebalance_counter
 
+        # Diagnostic baselines: how much of the return is just survivors-beta?
+        bh_return, bh_n = self._universe_buy_hold_return(trading_dates)
+        metrics["universe_buy_hold_pct"] = round(bh_return * 100, 2)
+        metrics["universe_size"] = bh_n
+        metrics["alpha_vs_universe_pct"] = round(
+            (metrics["total_return_pct"] / 100 - bh_return) * 100, 2
+        )
+        if topn_prob_means:
+            metrics["topn_prob_mean"] = round(float(np.mean(topn_prob_means)), 4)
+
         log.info(
             f"Backtest complete: "
             f"return={metrics['total_return_pct']:+.1f}%  "
@@ -390,6 +426,16 @@ class BacktestEngine:
             f"win_rate={metrics.get('win_rate_pct', 0):.1f}%  "
             f"trades={metrics.get('n_trades', 0)}"
         )
+        log.info(
+            f"Sanity baselines: "
+            f"universe equal-weight B&H={metrics['universe_buy_hold_pct']:+.1f}% "
+            f"({bh_n} symbols), α_vs_universe={metrics['alpha_vs_universe_pct']:+.1f}%"
+        )
+        if "topn_prob_mean" in metrics:
+            log.info(
+                f"Model confidence: mean top-{self.top_n} predicted prob = "
+                f"{metrics['topn_prob_mean']:.3f}"
+            )
         return {
             "equity_curve": equity,
             "trade_log": trades,
@@ -428,6 +474,14 @@ class BacktestEngine:
             rows.append(("Alpha vs Benchmark", f"{_color(m['alpha_pct'])}%"))
         if "information_ratio" in m:
             rows.append(("Information Ratio", _color(m['information_ratio'])))
+        if "universe_buy_hold_pct" in m:
+            rows.append((
+                f"Universe B&H (eq-weight, n={m.get('universe_size','-')})",
+                f"{m['universe_buy_hold_pct']:+.2f}%",
+            ))
+            rows.append(("α vs Universe B&H", f"{_color(m['alpha_vs_universe_pct'])}%"))
+        if "topn_prob_mean" in m:
+            rows.append((f"Mean top-N prob (diag.)", f"{m['topn_prob_mean']:.3f}"))
 
         for label, value in rows:
             table.add_row(label, value)
