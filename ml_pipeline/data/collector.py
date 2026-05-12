@@ -20,7 +20,13 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import yfinance as yf
 
-from stock_trading.data.fetcher import _akshare_call_with_retry, get_a_share_universe
+from stock_trading.data.fetcher import (
+    _akshare_call_with_retry,
+    fetch_a_index_history_sina,
+    fetch_a_share_history_sina,
+    get_a_share_universe,
+    resolve_a_share_data_source,
+)
 from stock_trading.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -50,12 +56,9 @@ def _load(path: Path) -> Optional[pd.DataFrame]:
 
 # ── A-share history ────────────────────────────────────────────────────────
 
-def fetch_a_share_history(
-    symbol: str,
-    start: str,
-    end: str,
+def _fetch_a_share_history_eastmoney(
+    symbol: str, start: str, end: str
 ) -> Optional[pd.DataFrame]:
-    """Fetch daily OHLCV for a single A-share (前复权) via AKShare, with retries."""
     import akshare as ak
 
     df = _akshare_call_with_retry(
@@ -81,11 +84,36 @@ def fetch_a_share_history(
     return out
 
 
+def fetch_a_share_history(
+    symbol: str,
+    start: str,
+    end: str,
+    source: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """Fetch daily OHLCV for a single A-share (前复权).
+
+    `source` is one of {"eastmoney", "sina"}; when None it's pulled from the
+    cached resolver verdict (see resolve_a_share_data_source).
+    """
+    if source is None:
+        # Resolver was already called by the collector; this picks up the cache.
+        source = resolve_a_share_data_source({})
+    if source == "sina":
+        return fetch_a_share_history_sina(symbol, start, end)
+    return _fetch_a_share_history_eastmoney(symbol, start, end)
+
+
 def fetch_a_index_history(
     start: str,
     end: str,
+    source: Optional[str] = None,
 ) -> Optional[pd.DataFrame]:
-    """Fetch 沪深300 index daily OHLCV via AKShare (with retries)."""
+    """Fetch 沪深300 index daily OHLCV; routes to Eastmoney or Sina."""
+    if source is None:
+        source = resolve_a_share_data_source({})
+    if source == "sina":
+        return fetch_a_index_history_sina(start, end, index_code=A_INDEX_SYMBOL)
+
     import akshare as ak
 
     df = _akshare_call_with_retry(
@@ -160,9 +188,10 @@ class HistoricalCollector:
     def collect_indices(self) -> None:
         """Download index data (沪深300 and S&P500)."""
         start, end = self._date_range()
+        source = resolve_a_share_data_source(self.uni_cfg)
 
         log.info("Collecting 沪深300 index history …")
-        df = fetch_a_index_history(start, end)
+        df = fetch_a_index_history(start, end, source=source)
         if df is not None:
             _save(df, _history_path(self.base_dir, "INDEX", "CSI300"))
             log.info(f"  CSI300: {len(df)} rows  ({df.index[0].date()} – {df.index[-1].date()})")
@@ -182,9 +211,10 @@ class HistoricalCollector:
         symbols = self._a_share_symbols()
         start, end = self._date_range()
         workers = max(1, int(self.uni_cfg.get("fetch_workers", 8)))
+        source = resolve_a_share_data_source(self.uni_cfg)
         log.info(
             f"Collecting A-share history for {len(symbols)} stocks "
-            f"({start} → {end}, workers={workers}) …"
+            f"({start} → {end}, workers={workers}, source={source}) …"
         )
 
         # Separate already-fresh files (today's) from those that need fetching.
@@ -216,7 +246,7 @@ class HistoricalCollector:
 
         def _job(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
             time.sleep(pace_min + random.random() * max(0.0, pace_max - pace_min))
-            return sym, fetch_a_share_history(sym, start, end)
+            return sym, fetch_a_share_history(sym, start, end, source=source)
 
         failed: List[str] = []
         done = 0
@@ -252,7 +282,7 @@ class HistoricalCollector:
             recovered = 0
             for i, sym in enumerate(failed, 1):
                 time.sleep(0.5 + random.random() * 0.5)
-                df = fetch_a_share_history(sym, start, end)
+                df = fetch_a_share_history(sym, start, end, source=source)
                 if df is not None and len(df) >= 120:
                     _save(df, _history_path(self.base_dir, "A", sym))
                     results[sym] = len(df)

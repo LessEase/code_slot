@@ -119,6 +119,148 @@ def _akshare_call_with_retry(
     return None
 
 
+# ── A-share data-source selection (Eastmoney vs Sina) ──────────────────────
+#
+# AKShare's default A-share endpoints (`stock_zh_a_hist`, `index_zh_a_hist`)
+# hit Eastmoney (push2his.eastmoney.com). On networks where Eastmoney is
+# blocked (e.g. some corporate egress firewalls) every request gets RST'd
+# and the entire collector hangs through its retries.
+#
+# Sina hosts a mirror dataset (`stock_zh_a_daily`, `stock_zh_index_daily`)
+# served from finance.sina.com.cn — different physical link, usually
+# reachable when Eastmoney isn't. We auto-detect at start of run and pin
+# the choice for the rest of the process.
+
+def _sina_stock_symbol(code: str) -> str:
+    """Convert 6-digit A-share code → sina-prefixed symbol (sh600000 / sz000001)."""
+    code = str(code).zfill(6)
+    if code.startswith(("600", "601", "603", "605", "688", "689", "900")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+def _eastmoney_reachable(timeout: float = 2.0) -> bool:
+    """One-shot HEAD/GET probe to Eastmoney's kline API.
+
+    Returns True only if a small canary request returns 2xx within `timeout`.
+    Any connection-level failure (RST, timeout, DNS) returns False.
+    """
+    import socket
+    import urllib.error
+    import urllib.request
+
+    url = (
+        "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+        "?secid=1.000300&klt=101&fqt=1&beg=20240101&end=20240110"
+    )
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 400
+    except (urllib.error.URLError, socket.timeout, ConnectionError, OSError):
+        return False
+
+
+_DATA_SOURCE_CACHE: Optional[str] = None
+
+
+def resolve_a_share_data_source(uni_cfg: dict) -> str:
+    """Decide which backend to use for A-share OHLCV ('eastmoney' or 'sina').
+
+    Behavior is controlled by `universe.a_share_data_source`:
+      "auto"       — probe Eastmoney once; on failure pin Sina for the run (default)
+      "eastmoney"  — force Eastmoney (legacy / when probe is unreliable)
+      "sina"       — force Sina (when you know Eastmoney is blocked)
+
+    The verdict is cached process-wide so the probe runs at most once.
+    """
+    global _DATA_SOURCE_CACHE
+    if _DATA_SOURCE_CACHE is not None:
+        return _DATA_SOURCE_CACHE
+
+    pref = (uni_cfg.get("a_share_data_source") or "auto").lower()
+    if pref in ("eastmoney", "sina"):
+        _DATA_SOURCE_CACHE = pref
+        log.info(f"A-share data source: {pref} (explicit)")
+        return pref
+
+    log.info("Probing Eastmoney reachability …")
+    if _eastmoney_reachable():
+        _DATA_SOURCE_CACHE = "eastmoney"
+        log.info("A-share data source: eastmoney (probe succeeded)")
+    else:
+        _DATA_SOURCE_CACHE = "sina"
+        log.warning(
+            "Eastmoney probe failed; using Sina backend for entire run "
+            "(set universe.a_share_data_source='eastmoney' to override)"
+        )
+    return _DATA_SOURCE_CACHE
+
+
+def fetch_a_share_history_sina(
+    symbol: str, start: str, end: str
+) -> Optional[pd.DataFrame]:
+    """Fetch daily OHLCV for one A-share via Sina (stock_zh_a_daily, qfq-adjusted).
+
+    Returns a DataFrame indexed by date with columns
+    [open, high, low, close, volume, amount] — same shape as the Eastmoney path.
+    """
+    import akshare as ak
+
+    sina_sym = _sina_stock_symbol(symbol)
+    # AKShare accepts both "YYYY-MM-DD" and "YYYYMMDD"; normalize to YYYYMMDD.
+    start_norm = start.replace("-", "")
+    end_norm = end.replace("-", "")
+
+    df = _akshare_call_with_retry(
+        f"stock_zh_a_daily({sina_sym})",
+        ak.stock_zh_a_daily,
+        symbol=sina_sym, adjust="qfq",
+        start_date=start_norm, end_date=end_norm,
+    )
+    if df is None or df.empty:
+        return None
+
+    # Sina returns `turnover` (CNY amount) — rename to match Eastmoney schema.
+    df = df.rename(columns={"turnover": "amount"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
+    out = df[keep].astype(float)
+    if "amount" not in out.columns:
+        out["amount"] = out["volume"] * out["close"]
+    return out
+
+
+def fetch_a_index_history_sina(
+    start: str, end: str, index_code: str = "000300"
+) -> Optional[pd.DataFrame]:
+    """Fetch an A-share index daily OHLCV via Sina (stock_zh_index_daily).
+
+    Sina returns full history regardless of date params, so we filter
+    client-side. Currently only CSI300 (sh000300) is wired in; other CSI
+    indices follow the same `sh000XXX` pattern.
+    """
+    import akshare as ak
+
+    code = str(index_code).zfill(6)
+    sina_sym = f"sh{code}" if code.startswith("000") else _sina_stock_symbol(code)
+
+    df = _akshare_call_with_retry(
+        f"stock_zh_index_daily({sina_sym})",
+        ak.stock_zh_index_daily,
+        symbol=sina_sym,
+    )
+    if df is None or df.empty:
+        return None
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    df = df.loc[start:end]
+    keep = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+    return df[keep].astype(float)
+
+
 def _pick_code_column(df: pd.DataFrame) -> Optional[str]:
     """Best-effort: find the column that holds 6-digit stock codes."""
     for c in ("code", "代码", "symbol", "Symbol", "证券代码"):

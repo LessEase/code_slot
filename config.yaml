@@ -15,6 +15,13 @@ universe:
   fetch_pace_min_sec: 0.15
   fetch_pace_max_sec: 0.40
 
+  # A 股 OHLCV 数据源：
+  #   "auto"      — 启动时探测 Eastmoney，不通则整轮自动切到 Sina（默认）
+  #   "eastmoney" — 强制走东方财富 (push2his.eastmoney.com)
+  #   "sina"      — 强制走新浪财经 (finance.sina.com.cn)，需在 Eastmoney 被
+  #                 出口防火墙阻断时使用
+  a_share_data_source: "auto"
+
   # 美股：标普500成分股
   us_market: true
   us_stock_list:            # 为空则自动从 Wikipedia 获取标普500列表
