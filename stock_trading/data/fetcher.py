@@ -5,6 +5,7 @@ Cache validity is controlled by config.data.cache_ttl_hours.
 """
 
 import os
+import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -67,14 +68,37 @@ def classify_a_share_board(code: str) -> str:
     return "OTHER"
 
 
-def _akshare_call_with_retry(
-    label: str, fn, *args, attempts: int = 3, base_delay: float = 2.0, **kwargs
-):
-    """Call an AKShare function with exponential backoff retries.
+_CONNECTION_RESET_SIGS = (
+    "RemoteDisconnected",
+    "ConnectionResetError",
+    "Connection aborted",
+    "Connection reset",
+    "ProtocolError",
+    "ReadTimeoutError",
+    "Read timed out",
+    "ConnectTimeout",
+    "Max retries exceeded",
+)
 
-    Connection resets (errno 54) and read timeouts from Eastmoney/Sina/etc
-    are common — most resolve on the next attempt. Returns None if every
-    attempt fails so callers can fall back to a different endpoint.
+
+def _is_connection_reset(err: BaseException) -> bool:
+    """True if the exception looks like upstream throttling / connection reset,
+    rather than a real parse error or empty response."""
+    s = repr(err)
+    return any(sig in s for sig in _CONNECTION_RESET_SIGS)
+
+
+def _akshare_call_with_retry(
+    label: str, fn, *args, attempts: int = 5, base_delay: float = 3.0, **kwargs
+):
+    """Call an AKShare function with exponential backoff + jitter.
+
+    Eastmoney aggressively closes TCP connections under load
+    (RemoteDisconnected / Connection aborted). Recovery requires
+    (a) waiting long enough for the per-IP throttle window to reopen,
+    (b) staggering retries across concurrent workers via jitter, and
+    (c) backing off harder on connection-reset errors than on parse
+    errors that won't be fixed by waiting.
     """
     last_err = None
     for i in range(1, attempts + 1):
@@ -82,10 +106,15 @@ def _akshare_call_with_retry(
             return fn(*args, **kwargs)
         except Exception as e:
             last_err = e
-            if i < attempts:
+            if i >= attempts:
+                break
+            if _is_connection_reset(e):
                 delay = base_delay * (2 ** (i - 1))
-                log.debug(f"{label} attempt {i}/{attempts} failed: {e}; retry in {delay:.0f}s")
-                time.sleep(delay)
+            else:
+                delay = base_delay * (1.5 ** (i - 1))
+            delay *= 0.7 + random.random() * 0.6  # ±30% jitter
+            log.debug(f"{label} attempt {i}/{attempts} failed: {e}; retry in {delay:.1f}s")
+            time.sleep(delay)
     log.warning(f"{label} failed after {attempts} attempts: {last_err}")
     return None
 
@@ -238,7 +267,6 @@ def fetch_a_share_ohlcv(
         ak.stock_zh_a_hist,
         symbol=symbol, period="daily",
         start_date=start, end_date=end, adjust="qfq",
-        attempts=3, base_delay=1.0,
     )
     if df is None or df.empty:
         return None

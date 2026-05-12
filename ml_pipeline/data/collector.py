@@ -10,6 +10,7 @@ fetcher used by the trading simulator so that backtest data can be
 accumulated independently.
 """
 
+import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -63,7 +64,6 @@ def fetch_a_share_history(
         symbol=symbol, period="daily",
         start_date=start.replace("-", ""), end_date=end.replace("-", ""),
         adjust="qfq",
-        attempts=3, base_delay=1.0,
     )
     if df is None or df.empty:
         return None
@@ -85,27 +85,24 @@ def fetch_a_index_history(
     start: str,
     end: str,
 ) -> Optional[pd.DataFrame]:
-    """Fetch 沪深300 index daily OHLCV via AKShare."""
+    """Fetch 沪深300 index daily OHLCV via AKShare (with retries)."""
     import akshare as ak
-    try:
-        df = ak.index_zh_a_hist(
-            symbol=A_INDEX_SYMBOL,
-            period="daily",
-            start_date=start.replace("-", ""),
-            end_date=end.replace("-", ""),
-        )
-        if df is None or df.empty:
-            return None
-        df = df.rename(columns={
-            "日期": "date", "开盘": "open", "收盘": "close",
-            "最高": "high", "最低": "low", "成交量": "volume",
-        })
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.set_index("date").sort_index()
-        return df[["open", "high", "low", "close", "volume"]].astype(float)
-    except Exception as e:
-        log.warning(f"A-share index fetch failed: {e}")
+
+    df = _akshare_call_with_retry(
+        f"index_zh_a_hist({A_INDEX_SYMBOL})",
+        ak.index_zh_a_hist,
+        symbol=A_INDEX_SYMBOL, period="daily",
+        start_date=start.replace("-", ""), end_date=end.replace("-", ""),
+    )
+    if df is None or df.empty:
         return None
+    df = df.rename(columns={
+        "日期": "date", "开盘": "open", "收盘": "close",
+        "最高": "high", "最低": "low", "成交量": "volume",
+    })
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    return df[["open", "high", "low", "close", "volume"]].astype(float)
 
 
 # ── US-stock history ───────────────────────────────────────────────────────
@@ -210,9 +207,18 @@ class HistoricalCollector:
 
         log.info(f"  {len(results)} cached, {len(to_fetch)} to download")
 
+        # Per-worker pacing: small randomized sleep before each request so the
+        # N workers don't fire in perfectly synchronized bursts (which is what
+        # makes Eastmoney RST connections en masse). 150–400ms per worker keeps
+        # the aggregate rate well under the throttling threshold.
+        pace_min = float(self.uni_cfg.get("fetch_pace_min_sec", 0.15))
+        pace_max = float(self.uni_cfg.get("fetch_pace_max_sec", 0.40))
+
         def _job(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            time.sleep(pace_min + random.random() * max(0.0, pace_max - pace_min))
             return sym, fetch_a_share_history(sym, start, end)
 
+        failed: List[str] = []
         done = 0
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {ex.submit(_job, s): s for s in to_fetch}
@@ -227,10 +233,34 @@ class HistoricalCollector:
                 if df is not None and len(df) >= 120:
                     _save(df, _history_path(self.base_dir, "A", sym))
                     results[sym] = len(df)
+                else:
+                    failed.append(sym)
                 if done % 100 == 0 or done == len(to_fetch):
                     log.info(
                         f"  A-share: {done}/{len(to_fetch)} fetched "
                         f"({len(results)}/{len(symbols)} valid overall)"
+                    )
+
+        # Second pass: retry failures sequentially with longer spacing. Many
+        # of these are healthy tickers that got RST during the parallel burst;
+        # giving them a single calm shot recovers most of them.
+        if failed:
+            log.info(
+                f"  Retrying {len(failed)} failed symbols sequentially "
+                f"(this can take a while) …"
+            )
+            recovered = 0
+            for i, sym in enumerate(failed, 1):
+                time.sleep(0.5 + random.random() * 0.5)
+                df = fetch_a_share_history(sym, start, end)
+                if df is not None and len(df) >= 120:
+                    _save(df, _history_path(self.base_dir, "A", sym))
+                    results[sym] = len(df)
+                    recovered += 1
+                if i % 50 == 0 or i == len(failed):
+                    log.info(
+                        f"  A-share retry: {i}/{len(failed)} attempted "
+                        f"({recovered} recovered)"
                     )
 
         log.info(f"A-share collection complete: {len(results)}/{len(symbols)} valid")

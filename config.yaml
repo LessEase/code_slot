@@ -8,8 +8,12 @@ universe:
   # 全市场扫描时启用的板块；BSE_MAIN (北交所) 默认不启用——规则不同（30%涨跌幅、100股门槛）
   a_share_boards: ["SH_MAIN", "SZ_MAIN", "ChiNext", "STAR"]
   a_share_limit: 0          # 0 = 不限；>0 则取前 N 只（按代码字典序，调试用）
-  # 历史下载并发度（AKShare 单线程很慢；并发 8 通常 OK，过高易被限流）
-  fetch_workers: 8
+  # 历史下载并发度。Eastmoney 单 IP 限流较严，>4 极易触发 RemoteDisconnected
+  # 连环重置；3 是经验上稳定且仍能在数十分钟内完成 5000+ 票全量下载的甜区。
+  fetch_workers: 3
+  # 每个 worker 在每次请求前的随机等待区间（秒），用于错开并发突刺。
+  fetch_pace_min_sec: 0.15
+  fetch_pace_max_sec: 0.40
 
   # 美股：标普500成分股
   us_market: true
