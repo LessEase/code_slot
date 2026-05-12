@@ -261,8 +261,14 @@ class HistoricalCollector:
                     log.debug(f"A-share fetch raised for {sym}: {e}")
                     df = None
                 if df is not None and len(df) >= 120:
-                    _save(df, _history_path(self.base_dir, "A", sym))
-                    results[sym] = len(df)
+                    try:
+                        _save(df, _history_path(self.base_dir, "A", sym))
+                        results[sym] = len(df)
+                    except Exception as e:
+                        # A bad single DataFrame (duplicate columns, unsupported
+                        # dtype, etc.) must not kill the whole 5000-stock run.
+                        log.warning(f"A-share save failed for {sym}: {e}")
+                        failed.append(sym)
                 else:
                     failed.append(sym)
                 if done % 100 == 0 or done == len(to_fetch):
@@ -282,11 +288,18 @@ class HistoricalCollector:
             recovered = 0
             for i, sym in enumerate(failed, 1):
                 time.sleep(0.5 + random.random() * 0.5)
-                df = fetch_a_share_history(sym, start, end, source=source)
+                try:
+                    df = fetch_a_share_history(sym, start, end, source=source)
+                except Exception as e:
+                    log.debug(f"A-share retry raised for {sym}: {e}")
+                    df = None
                 if df is not None and len(df) >= 120:
-                    _save(df, _history_path(self.base_dir, "A", sym))
-                    results[sym] = len(df)
-                    recovered += 1
+                    try:
+                        _save(df, _history_path(self.base_dir, "A", sym))
+                        results[sym] = len(df)
+                        recovered += 1
+                    except Exception as e:
+                        log.warning(f"A-share retry save failed for {sym}: {e}")
                 if i % 50 == 0 or i == len(failed):
                     log.info(
                         f"  A-share retry: {i}/{len(failed)} attempted "

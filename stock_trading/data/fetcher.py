@@ -221,8 +221,15 @@ def fetch_a_share_history_sina(
     if df is None or df.empty:
         return None
 
-    # Sina returns `turnover` (CNY amount) — rename to match Eastmoney schema.
-    df = df.rename(columns={"turnover": "amount"})
+    # AKShare's stock_zh_a_daily schema varies by version:
+    #   newer: date, open, high, low, close, volume, amount, outstanding_share, turnover
+    #          (amount = CNY traded, turnover = 换手率)
+    #   older: date, open, high, low, close, volume, outstanding_share, turnover
+    #          (turnover = CNY traded; no `amount` column)
+    # Only rename turnover→amount when an `amount` column isn't already present,
+    # otherwise we end up with two `amount` columns and parquet write blows up.
+    if "amount" not in df.columns and "turnover" in df.columns:
+        df = df.rename(columns={"turnover": "amount"})
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date").sort_index()
     keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
