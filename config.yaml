@@ -1,8 +1,16 @@
 # ── 全局配置 ─────────────────────────────────────────────────────
 universe:
-  # A股：从沪深300成分股抓取；设为 [] 则扫描全量（较慢）
-  a_share_index: "000300"   # 000300=沪深300, 000905=中证500
-  a_share_limit: 100        # 最多取前 N 只 A 股（调试期间缩小范围）
+  # A 股 universe 模式：
+  #   "all"   = 全市场扫描（沪/深主板 + 创业板 + 科创板，默认排除北交所）
+  #   "index" = 仅指数成分股（用 a_share_index 指定，如沪深300）
+  a_share_universe: "all"
+  a_share_index: "000300"   # 仅 a_share_universe == "index" 时生效
+  # 全市场扫描时启用的板块；BSE_MAIN (北交所) 默认不启用——规则不同（30%涨跌幅、100股门槛）
+  a_share_boards: ["SH_MAIN", "SZ_MAIN", "ChiNext", "STAR"]
+  a_share_limit: 0          # 0 = 不限；>0 则取前 N 只（按代码字典序，调试用）
+  # 历史下载并发度（AKShare 单线程很慢；并发 8 通常 OK，过高易被限流）
+  fetch_workers: 8
+
   # 美股：标普500成分股
   us_market: true
   us_stock_list:            # 为空则自动从 Wikipedia 获取标普500列表
@@ -108,4 +116,19 @@ ml_pipeline:
   backtest_holdout_months: 12 # 训练时排除最近 N 个月作为严格 OOS 回测窗口
   execution_lag_days: 1       # 信号在 t 日产生，t+lag 个交易日的收盘价成交
   slippage_bps: 10            # 单边滑点（基点），10 bps = 0.10%
-  a_share_price_limit: 0.095  # A 股涨跌幅 ≥ 此值视为封板，当日不可成交
+  # A 股板块各自的日涨跌幅上限（用于过滤"封板当日不可成交"的 fill）：
+  #   SH_MAIN / SZ_MAIN：主板 10%
+  #   ChiNext / STAR：创业板/科创板 20% (2020 改革后)
+  #   ST：风险警示股 5% (universe 里若含 ST 需配上)
+  a_share_price_limits:
+    SH_MAIN: 0.095
+    SZ_MAIN: 0.095
+    ChiNext: 0.195
+    STAR: 0.195
+    ST: 0.045
+    DEFAULT: 0.095
+
+  # ── 流动性过滤（point-in-time，无未来函数）────────────────────
+  # 仅交易过去 N 日均成交额超过阈值的股票；避免极低流动性票造成 fill 不真实
+  min_avg_turnover_cny: 50000000   # 5000 万 CNY
+  turnover_window_days: 20

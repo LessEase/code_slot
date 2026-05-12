@@ -42,6 +42,7 @@ from rich import box
 from ml_pipeline._lgbm import lgb
 from ml_pipeline.features.engineer import FEATURE_COLS
 from ml_pipeline.backtest.metrics import compute_all
+from stock_trading.data.fetcher import classify_a_share_board
 from stock_trading.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -199,8 +200,24 @@ class BacktestEngine:
         self.min_hold_days = ml.get("min_hold_days", 2)
         self.execution_lag_days = max(1, int(ml.get("execution_lag_days", 1)))
         self.slippage_bps = float(ml.get("slippage_bps", 0.0))
-        self.a_share_price_limit = float(ml.get("a_share_price_limit", 0.095))
-        self._a_limit_log_ret = float(np.log1p(self.a_share_price_limit))
+
+        # Board-aware price-limit table: ChiNext/STAR are 20%, ST is 5%.
+        # Falls back to legacy scalar `a_share_price_limit` when the new dict
+        # is absent (back-compat with older configs).
+        limit_cfg = ml.get("a_share_price_limits")
+        if isinstance(limit_cfg, dict):
+            self.a_share_price_limits = {k: float(v) for k, v in limit_cfg.items()}
+        else:
+            scalar = float(ml.get("a_share_price_limit", 0.095))
+            self.a_share_price_limits = {"DEFAULT": scalar}
+        self._a_limit_log_ret = {
+            k: float(np.log1p(v)) for k, v in self.a_share_price_limits.items()
+        }
+
+        # Point-in-time liquidity gate for A-share universe (avoids picking
+        # stocks too thin for the assumed fill model).
+        self.min_avg_turnover = float(ml.get("min_avg_turnover_cny", 0.0) or 0.0)
+
         self.max_pos_pct = cfg["portfolio"]["position_size_pct"]
         self.initial_capital = cfg["portfolio"]["initial_capital"]
         self.usd_cny = cfg["portfolio"]["usd_cny_rate"]
@@ -215,12 +232,22 @@ class BacktestEngine:
         return pd.DatetimeIndex(dates)
 
     def _score_stocks(self, dt: pd.Timestamp) -> pd.Series:
-        """Return {symbol: prob} for all stocks with data on day dt."""
+        """Return {symbol: prob} for all *liquid* stocks with data on day dt."""
         rows = {}
         for sym, df in self.feature_data.items():
             if dt not in df.index:
                 continue
             row = df.loc[dt]
+            # PIT liquidity gate: skip A-shares whose trailing 20d turnover
+            # is below the threshold. Other markets are unaffected.
+            if (
+                self.min_avg_turnover > 0
+                and self.market_map.get(sym) == "A"
+                and "amount_20d_avg" in row.index
+            ):
+                amt = row.get("amount_20d_avg")
+                if pd.isna(amt) or float(amt) < self.min_avg_turnover:
+                    continue
             avail = [c for c in self.feature_names if c in row.index]
             if len(avail) < len(self.feature_names) * 0.7:
                 continue
@@ -248,7 +275,8 @@ class BacktestEngine:
         Approximation: we only have end-of-day data, so we treat ``ret_1d``
         (log return today vs. yesterday's close) >= +limit as "limit-up"
         and <= -limit as "limit-down". This filters out the bulk of
-        unfillable A-share names.
+        unfillable A-share names. The threshold is board-specific:
+        SH/SZ main 10%, ChiNext/STAR 20%, ST 5%.
         """
         if self.market_map.get(symbol) != "A":
             return False
@@ -259,9 +287,13 @@ class BacktestEngine:
         if ret is None or pd.isna(ret):
             return False
         ret = float(ret)
+        board = classify_a_share_board(symbol)
+        limit_log = self._a_limit_log_ret.get(
+            board, self._a_limit_log_ret.get("DEFAULT", np.log1p(0.095))
+        )
         if side == "BUY":
-            return ret >= self._a_limit_log_ret
-        return ret <= -self._a_limit_log_ret
+            return ret >= limit_log
+        return ret <= -limit_log
 
     def _can_sell_today(self, pos: _Position, dt: pd.Timestamp) -> bool:
         """A-share T+1: buy day cannot also be sell day. Plus min_hold_days."""

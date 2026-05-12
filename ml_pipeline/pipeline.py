@@ -231,10 +231,11 @@ def step_backtest(cfg: dict, market: Optional[str] = None) -> None:
     """Run backtest using trained model on historical data."""
     log.info("═══ Step 5/5: Backtest ═══")
     log.warning(
-        "⚠ Survivorship bias: the universe is today's CSI300/S&P500 constituents — "
-        "delisted or demoted names are absent, so backtest returns are biased upward. "
-        "Compare 'α vs Universe B&H' (printed below) against pure model α to gauge how "
-        "much is alpha vs survivors-beta."
+        "⚠ Survivorship bias: the universe is built from *currently-listed* tickers — "
+        "names that delisted before today are absent, so backtest returns may be biased "
+        "upward (especially for A-share full-market mode where ~5% of historical names "
+        "are missing). Compare 'α vs Universe B&H' (printed below) against pure model α "
+        "to gauge how much is alpha vs survivors-beta."
     )
     registry = ModelRegistry(cfg["ml_pipeline"].get("model_dir", "data/models"))
     collector = HistoricalCollector(cfg)
