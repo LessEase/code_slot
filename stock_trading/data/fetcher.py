@@ -67,12 +67,101 @@ def classify_a_share_board(code: str) -> str:
     return "OTHER"
 
 
+def _akshare_call_with_retry(
+    label: str, fn, *args, attempts: int = 3, base_delay: float = 2.0, **kwargs
+):
+    """Call an AKShare function with exponential backoff retries.
+
+    Connection resets (errno 54) and read timeouts from Eastmoney/Sina/etc
+    are common — most resolve on the next attempt. Returns None if every
+    attempt fails so callers can fall back to a different endpoint.
+    """
+    last_err = None
+    for i in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if i < attempts:
+                delay = base_delay * (2 ** (i - 1))
+                log.debug(f"{label} attempt {i}/{attempts} failed: {e}; retry in {delay:.0f}s")
+                time.sleep(delay)
+    log.warning(f"{label} failed after {attempts} attempts: {last_err}")
+    return None
+
+
+def _pick_code_column(df: pd.DataFrame) -> Optional[str]:
+    """Best-effort: find the column that holds 6-digit stock codes."""
+    for c in ("code", "代码", "symbol", "Symbol", "证券代码"):
+        if c in df.columns:
+            return c
+    # Heuristic: first column whose first non-null value is a 6-digit string
+    for c in df.columns:
+        try:
+            sample = str(df[c].dropna().iloc[0])
+            if sample.isdigit() and len(sample) == 6:
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def _fetch_full_a_share_roster() -> Optional[pd.DataFrame]:
+    """Try multiple AKShare endpoints to get the full A-share roster.
+
+    The primary endpoint (stock_info_a_code_name) hits one Eastmoney URL;
+    if that's blocked / reset / rate-limited, we fall back to the spot-quote
+    endpoint (different URL), then to per-exchange listings (SH+SZ separately).
+    """
+    import akshare as ak
+
+    # Endpoint 1: dedicated code-name list (smallest payload)
+    df = _akshare_call_with_retry("stock_info_a_code_name", ak.stock_info_a_code_name)
+    if df is not None and not df.empty:
+        return df
+
+    # Endpoint 2: spot quote (different URL, heavier but more reliable)
+    log.info("Falling back to stock_zh_a_spot_em() for universe roster …")
+    df = _akshare_call_with_retry("stock_zh_a_spot_em", ak.stock_zh_a_spot_em)
+    if df is not None and not df.empty:
+        return df
+
+    # Endpoint 3: per-exchange listings (last resort, may need multiple calls)
+    log.info("Falling back to stock_info_sh_name_code + stock_info_sz_name_code …")
+    parts = []
+    sh = _akshare_call_with_retry(
+        "stock_info_sh_name_code",
+        ak.stock_info_sh_name_code, symbol="主板A股",
+    )
+    if sh is not None and not sh.empty:
+        parts.append(sh)
+    sh_star = _akshare_call_with_retry(
+        "stock_info_sh_name_code(科创板)",
+        ak.stock_info_sh_name_code, symbol="科创板",
+    )
+    if sh_star is not None and not sh_star.empty:
+        parts.append(sh_star)
+    sz = _akshare_call_with_retry(
+        "stock_info_sz_name_code",
+        ak.stock_info_sz_name_code, symbol="A股列表",
+    )
+    if sz is not None and not sz.empty:
+        parts.append(sz)
+    if parts:
+        return pd.concat(parts, ignore_index=True)
+
+    return None
+
+
 def get_a_share_universe(uni_cfg: dict) -> List[str]:
     """Return the A-share universe per config.
 
     Two modes:
       "all"   – pull the full A-share roster via AKShare and filter by board
       "index" – pull constituents of the given index (legacy behavior)
+
+    The "all" path tries three AKShare endpoints in order to survive
+    transient connection resets from any single Eastmoney URL.
     """
     import akshare as ak
 
@@ -81,30 +170,42 @@ def get_a_share_universe(uni_cfg: dict) -> List[str]:
 
     if mode == "all":
         boards = set(uni_cfg.get("a_share_boards", ["SH_MAIN", "SZ_MAIN", "ChiNext", "STAR"]))
-        try:
-            df = ak.stock_info_a_code_name()
-        except Exception as e:
-            log.warning(f"stock_info_a_code_name failed: {e}; universe will be empty")
+        df = _fetch_full_a_share_roster()
+        if df is None or df.empty:
+            log.warning(
+                "All A-share universe endpoints failed; universe is empty. "
+                "Check network / proxy / `pip install -U akshare`."
+            )
             return []
-        codes = df["code"].astype(str).str.zfill(6).tolist()
+
+        code_col = _pick_code_column(df)
+        if code_col is None:
+            log.warning(f"Couldn't locate a code column in roster; columns={list(df.columns)}")
+            return []
+
+        codes = df[code_col].astype(str).str.zfill(6).tolist()
         codes = [c for c in codes if classify_a_share_board(c) in boards]
-        codes.sort()
+        codes = sorted(set(codes))   # dedupe (per-exchange fallback can overlap)
         if limit > 0:
             codes = codes[:limit]
-        log.info(f"A-share universe (all, boards={sorted(boards)}): {len(codes)} symbols")
+        log.info(
+            f"A-share universe (all, boards={sorted(boards)}, "
+            f"source_col='{code_col}'): {len(codes)} symbols"
+        )
         return codes
 
     # index mode (legacy)
     index_code = uni_cfg.get("a_share_index", "000300")
-    try:
-        df = ak.index_stock_cons_csindex(symbol=index_code)
-        codes = df["成分券代码"].astype(str).str.zfill(6).tolist()
-        if limit > 0:
-            codes = codes[:limit]
-        return codes
-    except Exception as e:
-        log.warning(f"Failed to fetch A-share index {index_code}: {e}, falling back to empty list")
+    df = _akshare_call_with_retry(
+        f"index_stock_cons_csindex({index_code})",
+        ak.index_stock_cons_csindex, symbol=index_code,
+    )
+    if df is None or df.empty:
         return []
+    codes = df["成分券代码"].astype(str).str.zfill(6).tolist()
+    if limit > 0:
+        codes = codes[:limit]
+    return codes
 
 
 def get_a_share_stock_list(index_code: str = "000300", limit: int = 100) -> List[str]:
@@ -132,39 +233,35 @@ def fetch_a_share_ohlcv(
     end = datetime.today().strftime("%Y%m%d")
     start = (datetime.today() - timedelta(days=lookback_days + 30)).strftime("%Y%m%d")
 
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start,
-            end_date=end,
-            adjust="qfq",  # 前复权
-        )
-        if df is None or df.empty:
-            return None
-
-        df = df.rename(columns={
-            "日期": "date",
-            "开盘": "open",
-            "收盘": "close",
-            "最高": "high",
-            "最低": "low",
-            "成交量": "volume",
-            "成交额": "amount",
-        })
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.set_index("date").sort_index()
-        keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
-        df = df[keep].astype(float)
-        if "amount" not in df.columns:
-            df["amount"] = df["volume"] * df["close"]
-        df = df.tail(lookback_days)
-
-        _save(df, path)
-        return df
-    except Exception as e:
-        log.debug(f"A-share fetch failed for {symbol}: {e}")
+    df = _akshare_call_with_retry(
+        f"stock_zh_a_hist({symbol})",
+        ak.stock_zh_a_hist,
+        symbol=symbol, period="daily",
+        start_date=start, end_date=end, adjust="qfq",
+        attempts=3, base_delay=1.0,
+    )
+    if df is None or df.empty:
         return None
+
+    df = df.rename(columns={
+        "日期": "date",
+        "开盘": "open",
+        "收盘": "close",
+        "最高": "high",
+        "最低": "low",
+        "成交量": "volume",
+        "成交额": "amount",
+    })
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
+    df = df[keep].astype(float)
+    if "amount" not in df.columns:
+        df["amount"] = df["volume"] * df["close"]
+    df = df.tail(lookback_days)
+
+    _save(df, path)
+    return df
 
 
 # ---------------------------------------------------------------------------

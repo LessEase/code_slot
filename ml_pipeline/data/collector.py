@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import yfinance as yf
 
-from stock_trading.data.fetcher import get_a_share_universe
+from stock_trading.data.fetcher import _akshare_call_with_retry, get_a_share_universe
 from stock_trading.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -54,33 +54,31 @@ def fetch_a_share_history(
     start: str,
     end: str,
 ) -> Optional[pd.DataFrame]:
-    """Fetch daily OHLCV for a single A-share (前复权) via AKShare."""
+    """Fetch daily OHLCV for a single A-share (前复权) via AKShare, with retries."""
     import akshare as ak
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start.replace("-", ""),
-            end_date=end.replace("-", ""),
-            adjust="qfq",
-        )
-        if df is None or df.empty:
-            return None
-        df = df.rename(columns={
-            "日期": "date", "开盘": "open", "收盘": "close",
-            "最高": "high", "最低": "low", "成交量": "volume",
-            "成交额": "amount",
-        })
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.set_index("date").sort_index()
-        keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
-        out = df[keep].astype(float)
-        if "amount" not in out.columns:
-            out["amount"] = out["volume"] * out["close"]
-        return out
-    except Exception as e:
-        log.debug(f"A-share history failed for {symbol}: {e}")
+
+    df = _akshare_call_with_retry(
+        f"stock_zh_a_hist({symbol})",
+        ak.stock_zh_a_hist,
+        symbol=symbol, period="daily",
+        start_date=start.replace("-", ""), end_date=end.replace("-", ""),
+        adjust="qfq",
+        attempts=3, base_delay=1.0,
+    )
+    if df is None or df.empty:
         return None
+    df = df.rename(columns={
+        "日期": "date", "开盘": "open", "收盘": "close",
+        "最高": "high", "最低": "low", "成交量": "volume",
+        "成交额": "amount",
+    })
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date").sort_index()
+    keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
+    out = df[keep].astype(float)
+    if "amount" not in out.columns:
+        out["amount"] = out["volume"] * out["close"]
+    return out
 
 
 def fetch_a_index_history(

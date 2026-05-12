@@ -44,14 +44,19 @@ def fetch_industry_map() -> Dict[str, str]:
     """Pull {6-digit-code: industry-name} for the full A-share market.
 
     Uses Eastmoney board industries (~80 industries, finer than SW1's 28).
-    Slow first call (~30 industries × ~1s each); silent best-effort.
+    Same retry pattern as the universe selector so transient connection
+    resets don't wipe the whole mapping.
     """
     import akshare as ak
 
-    try:
-        boards = ak.stock_board_industry_name_em()
-    except Exception as e:
-        log.warning(f"stock_board_industry_name_em failed: {e}")
+    from stock_trading.data.fetcher import _akshare_call_with_retry
+
+    boards = _akshare_call_with_retry(
+        "stock_board_industry_name_em",
+        ak.stock_board_industry_name_em,
+        attempts=3, base_delay=2.0,
+    )
+    if boards is None or boards.empty:
         return {}
 
     name_col = "板块名称" if "板块名称" in boards.columns else boards.columns[0]
@@ -60,10 +65,12 @@ def fetch_industry_map() -> Dict[str, str]:
 
     mapping: Dict[str, str] = {}
     for i, industry in enumerate(industries, 1):
-        try:
-            cons = ak.stock_board_industry_cons_em(symbol=industry)
-        except Exception as e:
-            log.debug(f"  skip industry {industry}: {e}")
+        cons = _akshare_call_with_retry(
+            f"stock_board_industry_cons_em({industry})",
+            ak.stock_board_industry_cons_em, symbol=industry,
+            attempts=3, base_delay=1.0,
+        )
+        if cons is None or cons.empty:
             continue
         code_col = "代码" if "代码" in cons.columns else cons.columns[1]
         for code in cons[code_col].astype(str):
