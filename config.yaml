@@ -88,7 +88,20 @@ ml_pipeline:
 
   # ── 样本标签 ──────────────────────────────────────────────────
   forward_days: 5             # 预测 N 天后的涨跌
-  return_threshold: 0.03      # 标签=1 的条件：N天涨幅 > 3%
+  # label_mode:
+  #   "absolute"               y = 1 if  fwd_return  > return_threshold
+  #   "cross_section_quantile" y = 1 if  fwd_return 在当日 universe 内
+  #                            排名 >= cross_section_quantile（即"前 1-q"）
+  # 横截面分位标签消除 beta 依赖，在牛市/熊市都保持稳定的正样本率，
+  # 更适合 stock-picking。
+  label_mode: "cross_section_quantile"
+  return_threshold: 0.03      # 仅 label_mode == "absolute" 时生效
+  cross_section_quantile: 0.90   # top 10% 为正样本（更严格的 stock-picking 目标）
+
+  # 行业中性化：每个特征按 (date, industry) 做 z-score。模型只学
+  # "同行业内的相对信号"，不再被行业 beta 干扰。train 和 backtest
+  # 必须保持一致，否则推断分布会偏移。
+  neutralize_by_industry: true
 
   # ── 训练方案 ──────────────────────────────────────────────────
   train_years: 2.0            # walk-forward 训练窗口（年）
