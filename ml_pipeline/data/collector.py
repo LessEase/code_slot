@@ -11,6 +11,7 @@ accumulated independently.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import yfinance as yf
 
+from stock_trading.data.fetcher import get_a_share_universe
 from stock_trading.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -67,10 +69,15 @@ def fetch_a_share_history(
         df = df.rename(columns={
             "日期": "date", "开盘": "open", "收盘": "close",
             "最高": "high", "最低": "low", "成交量": "volume",
+            "成交额": "amount",
         })
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
-        return df[["open", "high", "low", "close", "volume"]].astype(float)
+        keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
+        out = df[keep].astype(float)
+        if "amount" not in out.columns:
+            out["amount"] = out["volume"] * out["close"]
+        return out
     except Exception as e:
         log.debug(f"A-share history failed for {symbol}: {e}")
         return None
@@ -148,15 +155,7 @@ class HistoricalCollector:
     # ── Universe helpers ───────────────────────────────────────────────────
 
     def _a_share_symbols(self) -> List[str]:
-        import akshare as ak
-        index_code = self.uni_cfg.get("a_share_index", "000300")
-        limit = self.uni_cfg.get("a_share_limit", 100)
-        try:
-            df = ak.index_stock_cons_csindex(symbol=index_code)
-            return df["成分券代码"].astype(str).str.zfill(6).tolist()[:limit]
-        except Exception as e:
-            log.warning(f"Could not fetch A-share universe: {e}")
-            return []
+        return get_a_share_universe(self.uni_cfg)
 
     def _us_symbols(self) -> List[str]:
         return self.uni_cfg.get("us_stock_list") or []
@@ -184,30 +183,57 @@ class HistoricalCollector:
             log.warning("  SP500: fetch failed")
 
     def collect_a_shares(self) -> Dict[str, int]:
-        """Download A-share history; returns {symbol: row_count}."""
+        """Download A-share history (parallel); returns {symbol: row_count}."""
         symbols = self._a_share_symbols()
         start, end = self._date_range()
-        log.info(f"Collecting A-share history for {len(symbols)} stocks ({start} → {end}) …")
+        workers = max(1, int(self.uni_cfg.get("fetch_workers", 8)))
+        log.info(
+            f"Collecting A-share history for {len(symbols)} stocks "
+            f"({start} → {end}, workers={workers}) …"
+        )
 
+        # Separate already-fresh files (today's) from those that need fetching.
+        to_fetch: List[str] = []
         results: Dict[str, int] = {}
-        for i, sym in enumerate(symbols, 1):
+        today = datetime.today().date()
+        for sym in symbols:
             path = _history_path(self.base_dir, "A", sym)
-            # Skip if file exists and was updated today
             if path.exists():
                 mtime = datetime.fromtimestamp(path.stat().st_mtime).date()
-                if mtime >= datetime.today().date():
+                if mtime >= today:
                     existing = _load(path)
                     results[sym] = len(existing) if existing is not None else 0
                     continue
+            to_fetch.append(sym)
 
-            df = fetch_a_share_history(sym, start, end)
-            if df is not None and len(df) >= 120:
-                _save(df, path)
-                results[sym] = len(df)
-            time.sleep(0.05)   # polite rate-limiting for AKShare
+        if not to_fetch:
+            log.info(f"A-share collection: all {len(symbols)} symbols already fresh today")
+            return results
 
-            if i % 20 == 0:
-                log.info(f"  A-share: {i}/{len(symbols)} done ({len(results)} valid)")
+        log.info(f"  {len(results)} cached, {len(to_fetch)} to download")
+
+        def _job(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            return sym, fetch_a_share_history(sym, start, end)
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_job, s): s for s in to_fetch}
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                done += 1
+                try:
+                    _, df = fut.result()
+                except Exception as e:
+                    log.debug(f"A-share fetch raised for {sym}: {e}")
+                    df = None
+                if df is not None and len(df) >= 120:
+                    _save(df, _history_path(self.base_dir, "A", sym))
+                    results[sym] = len(df)
+                if done % 100 == 0 or done == len(to_fetch):
+                    log.info(
+                        f"  A-share: {done}/{len(to_fetch)} fetched "
+                        f"({len(results)}/{len(symbols)} valid overall)"
+                    )
 
         log.info(f"A-share collection complete: {len(results)}/{len(symbols)} valid")
         return results

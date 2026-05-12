@@ -46,17 +46,74 @@ def _load(path: Path) -> pd.DataFrame:
 # A-share helpers (AKShare)
 # ---------------------------------------------------------------------------
 
-def get_a_share_stock_list(index_code: str = "000300", limit: int = 100) -> List[str]:
-    """Return constituent stock codes for the given A-share index."""
+# A-share board classification by 6-digit code prefix.
+#   SH_MAIN  : Shanghai main board       (600/601/603/605)
+#   SZ_MAIN  : Shenzhen main board       (000/001/002/003)
+#   ChiNext  : Growth Enterprise (创业板)  (300/301)        — 20% daily limit
+#   STAR     : Sci-Tech (科创板)          (688/689)        — 20% daily limit
+#   BSE_MAIN : Beijing Stock Exchange    (4xxxxx / 8xxxxx) — 30% daily limit
+def classify_a_share_board(code: str) -> str:
+    code = str(code).zfill(6)
+    if code.startswith(("600", "601", "603", "605")):
+        return "SH_MAIN"
+    if code.startswith(("000", "001", "002", "003")):
+        return "SZ_MAIN"
+    if code.startswith(("300", "301")):
+        return "ChiNext"
+    if code.startswith(("688", "689")):
+        return "STAR"
+    if code.startswith(("4", "8")):
+        return "BSE_MAIN"
+    return "OTHER"
+
+
+def get_a_share_universe(uni_cfg: dict) -> List[str]:
+    """Return the A-share universe per config.
+
+    Two modes:
+      "all"   – pull the full A-share roster via AKShare and filter by board
+      "index" – pull constituents of the given index (legacy behavior)
+    """
     import akshare as ak
 
+    mode = uni_cfg.get("a_share_universe", "index")
+    limit = int(uni_cfg.get("a_share_limit", 0) or 0)
+
+    if mode == "all":
+        boards = set(uni_cfg.get("a_share_boards", ["SH_MAIN", "SZ_MAIN", "ChiNext", "STAR"]))
+        try:
+            df = ak.stock_info_a_code_name()
+        except Exception as e:
+            log.warning(f"stock_info_a_code_name failed: {e}; universe will be empty")
+            return []
+        codes = df["code"].astype(str).str.zfill(6).tolist()
+        codes = [c for c in codes if classify_a_share_board(c) in boards]
+        codes.sort()
+        if limit > 0:
+            codes = codes[:limit]
+        log.info(f"A-share universe (all, boards={sorted(boards)}): {len(codes)} symbols")
+        return codes
+
+    # index mode (legacy)
+    index_code = uni_cfg.get("a_share_index", "000300")
     try:
         df = ak.index_stock_cons_csindex(symbol=index_code)
         codes = df["成分券代码"].astype(str).str.zfill(6).tolist()
-        return codes[:limit]
+        if limit > 0:
+            codes = codes[:limit]
+        return codes
     except Exception as e:
         log.warning(f"Failed to fetch A-share index {index_code}: {e}, falling back to empty list")
         return []
+
+
+def get_a_share_stock_list(index_code: str = "000300", limit: int = 100) -> List[str]:
+    """Backward-compatible: legacy index-based selector."""
+    return get_a_share_universe({
+        "a_share_universe": "index",
+        "a_share_index": index_code,
+        "a_share_limit": limit,
+    })
 
 
 def fetch_a_share_ohlcv(
@@ -93,10 +150,14 @@ def fetch_a_share_ohlcv(
             "最高": "high",
             "最低": "low",
             "成交量": "volume",
+            "成交额": "amount",
         })
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date").sort_index()
-        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        keep = [c for c in ["open", "high", "low", "close", "volume", "amount"] if c in df.columns]
+        df = df[keep].astype(float)
+        if "amount" not in df.columns:
+            df["amount"] = df["volume"] * df["close"]
         df = df.tail(lookback_days)
 
         _save(df, path)
@@ -154,10 +215,7 @@ class DataFetcher:
         universe: Dict[str, str] = {}
 
         # A-shares
-        a_codes = get_a_share_stock_list(
-            index_code=self.uni_cfg.get("a_share_index", "000300"),
-            limit=self.uni_cfg.get("a_share_limit", 100),
-        )
+        a_codes = get_a_share_universe(self.uni_cfg)
         for code in a_codes:
             universe[code] = "A"
 

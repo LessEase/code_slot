@@ -63,6 +63,16 @@ def compute_stock_features(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=df.index)
     out["close"] = df["close"]
 
+    # Auxiliary liquidity column (not a model feature, but kept on the feature
+    # matrix so downstream stages can apply a point-in-time turnover filter
+    # without re-loading raw OHLCV). Falls back to volume*close if exchange-
+    # provided 成交额 is missing (yfinance for US, older A-share parquet).
+    if "amount" in df.columns:
+        amt = df["amount"]
+    else:
+        amt = df["volume"] * df["close"]
+    out["amount_20d_avg"] = amt.rolling(20, min_periods=10).mean()
+
     log_ret = np.log(df["close"] / df["close"].shift(1))
     out["ret_1d"] = log_ret
     out["ret_3d"] = np.log(df["close"] / df["close"].shift(3))

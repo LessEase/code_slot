@@ -53,12 +53,19 @@ def build_sample_df(
     market: str,
     forward_days: int,
     threshold: float,
+    min_avg_turnover: float = 0.0,
 ) -> Optional[pd.DataFrame]:
     """
     Build (X, y) rows for a single stock.
 
     Returns a DataFrame with FEATURE_COLS + ['symbol', 'market', 'label'],
     indexed by date.  Rows with NaN label (last forward_days rows) are dropped.
+
+    When ``min_avg_turnover > 0`` and the feature matrix carries an
+    ``amount_20d_avg`` column, any row whose trailing 20-day average turnover
+    is below the threshold is dropped. This filter is point-in-time and is
+    only applied to A-share rows; for other markets the column is permitted
+    to be absent (no filtering).
     """
     if feat.empty:
         return None
@@ -73,6 +80,12 @@ def build_sample_df(
     df["symbol"] = symbol
     df["market"] = market
 
+    # Apply liquidity filter (A-share only). Using `feat`'s aux column so it
+    # doesn't pollute the feature space.
+    if min_avg_turnover > 0 and market == "A" and "amount_20d_avg" in feat.columns:
+        liquid = feat["amount_20d_avg"].reindex(df.index)
+        df = df[liquid.fillna(0.0) >= min_avg_turnover]
+
     # Drop rows with NaN label or any NaN in feature columns
     df = df.dropna(subset=["label"] + available)
     df["label"] = df["label"].astype(int)
@@ -85,6 +98,7 @@ class SampleGenerator:
         ml = cfg["ml_pipeline"]
         self.forward_days = ml["forward_days"]
         self.threshold = ml["return_threshold"]
+        self.min_avg_turnover = float(ml.get("min_avg_turnover_cny", 0.0) or 0.0)
         self.output_dir = Path("data/ml")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -101,7 +115,10 @@ class SampleGenerator:
         parts: List[pd.DataFrame] = []
         skipped = 0
         for sym, feat in feature_data.items():
-            df = build_sample_df(feat, sym, market, self.forward_days, self.threshold)
+            df = build_sample_df(
+                feat, sym, market, self.forward_days, self.threshold,
+                min_avg_turnover=self.min_avg_turnover,
+            )
             if df is not None:
                 parts.append(df)
             else:
