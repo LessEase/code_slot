@@ -23,6 +23,7 @@ from rich.table import Table
 from rich import box
 
 from ml_pipeline.data.collector import HistoricalCollector
+from ml_pipeline.data.industry import load_industry_map
 from ml_pipeline.features.engineer import build_feature_matrix, FEATURE_COLS
 from ml_pipeline.samples.generator import SampleGenerator
 from ml_pipeline.models.trainer import ModelTrainer
@@ -111,13 +112,20 @@ def step_samples(cfg: dict) -> Dict[str, pd.DataFrame]:
     """Generate labeled training samples from feature matrices."""
     log.info("═══ Step 3/5: Sample Generation ═══")
     generator = SampleGenerator(cfg)
+    # Industry mapping is only meaningful for A-share neutralization; loaded
+    # lazily (with a 30-day cache so the AKShare crawl runs at most monthly).
+    industry_map = (
+        load_industry_map(cfg["ml_pipeline"].get("history_dir", "data/history"))
+        if cfg["ml_pipeline"].get("neutralize_by_industry", False)
+        else None
+    )
     result = {}
     for market in MARKETS:
         features = _load_features(market)
         if not features:
             log.warning(f"No features for {market}, run --features first")
             continue
-        samples = generator.generate(features, market)
+        samples = generator.generate(features, market, industry_map=industry_map)
         if not samples.empty:
             result[market] = samples
     return result
@@ -239,6 +247,11 @@ def step_backtest(cfg: dict, market: Optional[str] = None) -> None:
     )
     registry = ModelRegistry(cfg["ml_pipeline"].get("model_dir", "data/models"))
     collector = HistoricalCollector(cfg)
+    industry_map = (
+        load_industry_map(cfg["ml_pipeline"].get("history_dir", "data/history"))
+        if cfg["ml_pipeline"].get("neutralize_by_industry", False)
+        else None
+    )
 
     markets_to_test = [market] if market else MARKETS
 
@@ -283,7 +296,9 @@ def step_backtest(cfg: dict, market: Optional[str] = None) -> None:
             benchmark = index_df["close"].rename("benchmark")
             benchmark.index = pd.to_datetime(benchmark.index)
 
-        engine = BacktestEngine(cfg, model, meta, features, market_map)
+        engine = BacktestEngine(
+            cfg, model, meta, features, market_map, industry_map=industry_map,
+        )
         result = engine.run(start, end, benchmark)
         engine.print_report(result, mkt)
 

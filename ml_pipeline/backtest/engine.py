@@ -42,6 +42,7 @@ from rich import box
 from ml_pipeline._lgbm import lgb
 from ml_pipeline.features.engineer import FEATURE_COLS
 from ml_pipeline.backtest.metrics import compute_all
+from ml_pipeline.data.industry import UNKNOWN_INDUSTRY
 from stock_trading.data.fetcher import classify_a_share_board
 from stock_trading.utils.logger import get_logger
 
@@ -188,16 +189,22 @@ class BacktestEngine:
         meta: dict,
         feature_data: Dict[str, pd.DataFrame],
         market_map: Dict[str, str],
+        industry_map: Optional[Dict[str, str]] = None,
     ):
         self.cfg = cfg
         self.model = model
         self.feature_names = meta["feature_names"]
         self.feature_data = feature_data
         self.market_map = market_map
+        self.industry_map = industry_map or {}
         ml = cfg["ml_pipeline"]
         self.rebalance_days = ml["rebalance_days"]
         self.top_n = ml["top_n"]
         self.min_hold_days = ml.get("min_hold_days", 2)
+        # Match training-time neutralization. If a model was trained with
+        # neutralize_by_industry=true we MUST apply the same transform at
+        # inference, otherwise feature distributions diverge sharply.
+        self.neutralize = bool(ml.get("neutralize_by_industry", False))
         self.execution_lag_days = max(1, int(ml.get("execution_lag_days", 1)))
         self.slippage_bps = float(ml.get("slippage_bps", 0.0))
 
@@ -232,14 +239,19 @@ class BacktestEngine:
         return pd.DatetimeIndex(dates)
 
     def _score_stocks(self, dt: pd.Timestamp) -> pd.Series:
-        """Return {symbol: prob} for all *liquid* stocks with data on day dt."""
-        rows = {}
+        """Return {symbol: prob} for all *liquid* stocks with data on day dt.
+
+        When ``neutralize_by_industry`` is enabled, features for the day's
+        cross-section are z-scored within each (industry) bucket before
+        prediction — matching the transformation applied at training time.
+        """
+        # Step 1: collect feature rows for every eligible stock on dt
+        symbols: List[str] = []
+        rows: List[pd.Series] = []
         for sym, df in self.feature_data.items():
             if dt not in df.index:
                 continue
             row = df.loc[dt]
-            # PIT liquidity gate: skip A-shares whose trailing 20d turnover
-            # is below the threshold. Other markets are unaffected.
             if (
                 self.min_avg_turnover > 0
                 and self.market_map.get(sym) == "A"
@@ -248,13 +260,37 @@ class BacktestEngine:
                 amt = row.get("amount_20d_avg")
                 if pd.isna(amt) or float(amt) < self.min_avg_turnover:
                     continue
-            avail = [c for c in self.feature_names if c in row.index]
-            if len(avail) < len(self.feature_names) * 0.7:
+            avail_count = sum(1 for c in self.feature_names if c in row.index)
+            if avail_count < len(self.feature_names) * 0.7:
                 continue
-            x = pd.DataFrame([row[avail].reindex(self.feature_names).fillna(0)])
-            prob = float(self.model.predict(x)[0])
-            rows[sym] = prob
-        return pd.Series(rows).sort_values(ascending=False)
+            symbols.append(sym)
+            rows.append(row[self.feature_names].reindex(self.feature_names))
+
+        if not symbols:
+            return pd.Series(dtype=float)
+
+        X = pd.DataFrame(rows, index=symbols).astype(float)
+
+        # Step 2: industry z-score (cross-section on this single date)
+        if self.neutralize:
+            industries = pd.Series(
+                [self.industry_map.get(s.zfill(6), UNKNOWN_INDUSTRY) for s in symbols],
+                index=symbols,
+            )
+            grouped = X.groupby(industries.values, sort=False)
+            means = grouped.transform("mean")
+            stds = grouped.transform("std").replace(0, np.nan)
+            sizes = industries.groupby(industries.values).transform("size")
+            # Keep z-scores only where the industry group is non-degenerate;
+            # otherwise zero (the model sees "no industry signal").
+            keep = pd.Series(sizes.values >= 5, index=X.index)
+            X = ((X - means) / stds).where(keep, 0.0).fillna(0.0).clip(-5, 5)
+        else:
+            X = X.fillna(0.0)
+
+        # Step 3: batch predict
+        probs = self.model.predict(X)
+        return pd.Series(probs, index=symbols).sort_values(ascending=False)
 
     def _get_price(self, symbol: str, dt: pd.Timestamp) -> Optional[float]:
         """Return close price of symbol on day dt (or nearest prior day)."""
