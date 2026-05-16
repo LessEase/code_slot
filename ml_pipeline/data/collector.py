@@ -129,6 +129,33 @@ def fetch_us_index_history(start: str, end: str) -> Optional[pd.DataFrame]:
     return fetch_us_history(US_INDEX_SYMBOL, start, end)
 
 
+# ── Progress logging ───────────────────────────────────────────────────────
+
+class _ProgressTracker:
+    """Logs download progress at fixed time intervals (with ETA)."""
+
+    def __init__(self, label: str, total: int, interval: float = 30.0):
+        self.label = label
+        self.total = total
+        self.interval = interval
+        self.start = time.time()
+        self._last_log = self.start
+
+    def update(self, done: int, valid: int, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_log < self.interval:
+            return
+        self._last_log = now
+        elapsed = now - self.start
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (self.total - done) / rate if rate > 0 else 0.0
+        pct = 100.0 * done / self.total if self.total else 100.0
+        log.info(
+            f"  {self.label}: {done}/{self.total} ({pct:.0f}%)  "
+            f"{valid} valid  elapsed {elapsed:.0f}s  ETA {eta:.0f}s"
+        )
+
+
 # ── Main collector class ───────────────────────────────────────────────────
 
 class HistoricalCollector:
@@ -190,6 +217,7 @@ class HistoricalCollector:
         log.info(f"Collecting A-share history for {len(symbols)} stocks ({start} → {end}) …")
 
         results: Dict[str, int] = {}
+        progress = _ProgressTracker("A-share", len(symbols))
         for i, sym in enumerate(symbols, 1):
             path = _history_path(self.base_dir, "A", sym)
             # Skip if file exists and was updated today
@@ -198,6 +226,7 @@ class HistoricalCollector:
                 if mtime >= datetime.today().date():
                     existing = _load(path)
                     results[sym] = len(existing) if existing is not None else 0
+                    progress.update(i, len(results))
                     continue
 
             df = fetch_a_share_history(sym, start, end)
@@ -206,9 +235,9 @@ class HistoricalCollector:
                 results[sym] = len(df)
             time.sleep(0.05)   # polite rate-limiting for AKShare
 
-            if i % 20 == 0:
-                log.info(f"  A-share: {i}/{len(symbols)} done ({len(results)} valid)")
+            progress.update(i, len(results))
 
+        progress.update(len(symbols), len(results), force=True)
         log.info(f"A-share collection complete: {len(results)}/{len(symbols)} valid")
         return results
 
@@ -219,6 +248,7 @@ class HistoricalCollector:
         log.info(f"Collecting US stock history for {len(symbols)} stocks …")
 
         results: Dict[str, int] = {}
+        progress = _ProgressTracker("US stock", len(symbols))
         for i, sym in enumerate(symbols, 1):
             path = _history_path(self.base_dir, "US", sym)
             if path.exists():
@@ -226,6 +256,7 @@ class HistoricalCollector:
                 if mtime >= datetime.today().date():
                     existing = _load(path)
                     results[sym] = len(existing) if existing is not None else 0
+                    progress.update(i, len(results))
                     continue
 
             df = fetch_us_history(sym, start, end)
@@ -233,6 +264,9 @@ class HistoricalCollector:
                 _save(df, path)
                 results[sym] = len(df)
 
+            progress.update(i, len(results))
+
+        progress.update(len(symbols), len(results), force=True)
         log.info(f"US stock collection complete: {len(results)}/{len(symbols)} valid")
         return results
 
