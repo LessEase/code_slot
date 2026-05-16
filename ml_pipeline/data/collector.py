@@ -25,6 +25,7 @@ from stock_trading.data.fetcher import (
     fetch_a_index_history_sina,
     fetch_a_share_history_sina,
     get_a_share_universe,
+    get_us_universe,
     resolve_a_share_data_source,
 )
 from stock_trading.utils.logger import get_logger
@@ -139,19 +140,28 @@ def fetch_us_history(
     symbol: str,
     start: str,
     end: str,
+    attempts: int = 3,
 ) -> Optional[pd.DataFrame]:
-    """Fetch daily OHLCV for a US stock via yfinance."""
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(start=start, end=end, auto_adjust=True)
-        if df is None or df.empty:
-            return None
-        df.index = pd.to_datetime(df.index).tz_localize(None)
-        df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
-        return df.sort_index()
-    except Exception as e:
-        log.debug(f"US history failed for {symbol}: {e}")
-        return None
+    """Fetch daily OHLCV for a US stock via yfinance, with light retries.
+
+    Yahoo intermittently returns empty frames or HTTP 429 under bulk load;
+    a couple of jittered retries recover most of those.
+    """
+    for i in range(1, attempts + 1):
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start, end=end, auto_adjust=True)
+            if df is not None and not df.empty:
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                df = df.rename(columns=str.lower)[
+                    ["open", "high", "low", "close", "volume"]
+                ]
+                return df.sort_index()
+        except Exception as e:
+            log.debug(f"US history attempt {i}/{attempts} failed for {symbol}: {e}")
+        if i < attempts:
+            time.sleep(1.5 * i + random.random())
+    return None
 
 
 def fetch_us_index_history(start: str, end: str) -> Optional[pd.DataFrame]:
@@ -181,7 +191,7 @@ class HistoricalCollector:
         return get_a_share_universe(self.uni_cfg)
 
     def _us_symbols(self) -> List[str]:
-        return self.uni_cfg.get("us_stock_list") or []
+        return get_us_universe(self.uni_cfg)
 
     # ── Collection methods ─────────────────────────────────────────────────
 
@@ -310,25 +320,63 @@ class HistoricalCollector:
         return results
 
     def collect_us_stocks(self) -> Dict[str, int]:
-        """Download US stock history; returns {symbol: row_count}."""
+        """Download US stock history (parallel); returns {symbol: row_count}."""
         symbols = self._us_symbols()
         start, end = self._date_range()
-        log.info(f"Collecting US stock history for {len(symbols)} stocks …")
+        workers = max(1, int(self.uni_cfg.get("us_fetch_workers", 8)))
+        log.info(
+            f"Collecting US stock history for {len(symbols)} stocks "
+            f"(workers={workers}) …"
+        )
 
+        to_fetch: List[str] = []
         results: Dict[str, int] = {}
-        for i, sym in enumerate(symbols, 1):
+        today = datetime.today().date()
+        for sym in symbols:
             path = _history_path(self.base_dir, "US", sym)
             if path.exists():
                 mtime = datetime.fromtimestamp(path.stat().st_mtime).date()
-                if mtime >= datetime.today().date():
+                if mtime >= today:
                     existing = _load(path)
                     results[sym] = len(existing) if existing is not None else 0
                     continue
+            to_fetch.append(sym)
 
-            df = fetch_us_history(sym, start, end)
-            if df is not None and len(df) >= 120:
-                _save(df, path)
-                results[sym] = len(df)
+        if not to_fetch:
+            log.info(f"US collection: all {len(symbols)} symbols already fresh today")
+            return results
+
+        log.info(f"  {len(results)} cached, {len(to_fetch)} to download")
+
+        pace_min = float(self.uni_cfg.get("fetch_pace_min_sec", 0.15))
+        pace_max = float(self.uni_cfg.get("fetch_pace_max_sec", 0.40))
+
+        def _job(sym: str) -> Tuple[str, Optional[pd.DataFrame]]:
+            time.sleep(pace_min + random.random() * max(0.0, pace_max - pace_min))
+            return sym, fetch_us_history(sym, start, end)
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_job, s): s for s in to_fetch}
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                done += 1
+                try:
+                    _, df = fut.result()
+                except Exception as e:
+                    log.debug(f"US fetch raised for {sym}: {e}")
+                    df = None
+                if df is not None and len(df) >= 120:
+                    try:
+                        _save(df, _history_path(self.base_dir, "US", sym))
+                        results[sym] = len(df)
+                    except Exception as e:
+                        log.warning(f"US save failed for {sym}: {e}")
+                if done % 200 == 0 or done == len(to_fetch):
+                    log.info(
+                        f"  US: {done}/{len(to_fetch)} fetched "
+                        f"({len(results)}/{len(symbols)} valid overall)"
+                    )
 
         log.info(f"US stock collection complete: {len(results)}/{len(symbols)} valid")
         return results

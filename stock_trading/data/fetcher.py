@@ -395,6 +395,143 @@ def get_a_share_stock_list(index_code: str = "000300", limit: int = 100) -> List
     })
 
 
+# ---------------------------------------------------------------------------
+# US universe (NASDAQ Trader symbol directory)
+# ---------------------------------------------------------------------------
+#
+# NASDAQ Trader publishes the full, official symbol roster as two pipe-
+# delimited files (free, no auth):
+#   nasdaqlisted.txt — every NASDAQ-listed security
+#   otherlisted.txt  — NYSE, NYSE American, NYSE Arca, etc.
+# We download both, drop test issues / warrants / rights / units / preferred
+# (keeping common stock + ETFs), and cache the result on disk.
+
+_NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+_OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+
+
+def _fetch_nasdaq_trader_file(url: str, label: str) -> Optional[pd.DataFrame]:
+    """Download and parse a pipe-delimited NASDAQ Trader symbol file."""
+    import io
+    import urllib.request
+
+    def _do():
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+        # The final line is a "File Creation Time:" footer — strip it.
+        lines = [
+            ln for ln in raw.splitlines()
+            if ln and not ln.startswith("File Creation Time")
+        ]
+        return pd.read_csv(io.StringIO("\n".join(lines)), sep="|", dtype=str)
+
+    return _akshare_call_with_retry(label, _do, attempts=4, base_delay=3.0)
+
+
+def _us_symbol_for_yfinance(sym: str) -> str:
+    """NASDAQ Trader denotes share classes with '.'; yfinance expects '-'
+    (e.g. BRK.B → BRK-B)."""
+    return sym.strip().upper().replace(".", "-")
+
+
+def _is_excluded_us_security(name: str) -> bool:
+    """True for warrants / rights / units / preferred / notes — i.e. anything
+    that isn't a common share or an ETF."""
+    n = (name or "").lower()
+    if any(k in n for k in (
+        "warrant", "depositary", "debenture", "preferred",
+        "convertible note", "% note", "subordinated",
+    )):
+        return True
+    # token-level check so "Wright"/"United" don't false-positive on right/unit
+    tokens = set(n.replace("-", " ").replace(",", " ").replace(".", " ").split())
+    return bool(tokens & {"right", "rights", "unit", "units"})
+
+
+def get_us_universe(uni_cfg: dict) -> List[str]:
+    """Return the US stock universe per config.
+
+    Modes (universe.us_universe):
+      "all"  — full NASDAQ + NYSE/AMEX roster from NASDAQ Trader files
+      "list" — the explicit us_stock_list (legacy behavior)
+
+    In "all" mode the roster is cached on disk for us_universe_cache_days
+    so we don't re-download every run. On fetch failure we fall back to
+    us_stock_list so a transient network error doesn't empty the universe.
+    """
+    mode = (uni_cfg.get("us_universe") or "list").lower()
+    fallback = list(uni_cfg.get("us_stock_list") or [])
+    if mode != "all":
+        return fallback
+
+    include_etf = bool(uni_cfg.get("us_include_etf", True))
+    limit = int(uni_cfg.get("us_stock_limit", 0) or 0)
+    cache_days = float(uni_cfg.get("us_universe_cache_days", 7))
+    cache_dir = uni_cfg.get("us_universe_cache_dir", "data/history")
+    cache_path = Path(cache_dir) / "US_universe.txt"
+
+    if cache_path.exists():
+        age_days = (time.time() - cache_path.stat().st_mtime) / 86400.0
+        if age_days < cache_days:
+            syms = [s.strip() for s in cache_path.read_text().splitlines() if s.strip()]
+            if syms:
+                log.info(f"US universe (all): {len(syms)} symbols (cached)")
+                return syms[:limit] if limit > 0 else syms
+
+    frames: List[pd.DataFrame] = []
+    nd = _fetch_nasdaq_trader_file(_NASDAQ_LISTED_URL, "nasdaqlisted.txt")
+    if nd is not None and not nd.empty:
+        nd = nd.rename(columns=lambda c: c.strip())
+        frames.append(pd.DataFrame({
+            "sym": nd["Symbol"].astype(str),
+            "name": nd["Security Name"].astype(str),
+            "test": nd.get("Test Issue", "N").astype(str),
+            "etf": nd.get("ETF", "N").astype(str),
+        }))
+    ot = _fetch_nasdaq_trader_file(_OTHER_LISTED_URL, "otherlisted.txt")
+    if ot is not None and not ot.empty:
+        ot = ot.rename(columns=lambda c: c.strip())
+        sym_col = "ACT Symbol" if "ACT Symbol" in ot.columns else "NASDAQ Symbol"
+        frames.append(pd.DataFrame({
+            "sym": ot[sym_col].astype(str),
+            "name": ot["Security Name"].astype(str),
+            "test": ot.get("Test Issue", "N").astype(str),
+            "etf": ot.get("ETF", "N").astype(str),
+        }))
+
+    if not frames:
+        log.warning(
+            "US universe: NASDAQ Trader fetch failed; "
+            f"falling back to us_stock_list ({len(fallback)} symbols)"
+        )
+        return fallback
+
+    roster = pd.concat(frames, ignore_index=True)
+    roster = roster[roster["test"].str.upper().str.strip() != "Y"]
+    if not include_etf:
+        roster = roster[roster["etf"].str.upper().str.strip() != "Y"]
+    roster = roster[~roster["name"].apply(_is_excluded_us_security)]
+
+    out: List[str] = []
+    seen = set()
+    for raw in roster["sym"].tolist():
+        s = (raw or "").strip()
+        if not s or any(ch in s for ch in "$^+ "):  # preferred/warrant notation
+            continue
+        y = _us_symbol_for_yfinance(s)
+        if y and y not in seen:
+            seen.add(y)
+            out.append(y)
+    out.sort()
+
+    if out:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text("\n".join(out))
+    log.info(f"US universe (all, include_etf={include_etf}): {len(out)} symbols")
+    return out[:limit] if limit > 0 else out
+
+
 def fetch_a_share_ohlcv(
     symbol: str,
     lookback_days: int,
@@ -495,8 +632,7 @@ class DataFetcher:
 
         # US stocks
         if self.uni_cfg.get("us_market", True):
-            us_list = self.uni_cfg.get("us_stock_list") or []
-            for sym in us_list:
+            for sym in get_us_universe(self.uni_cfg):
                 universe[sym] = "US"
 
         log.info(f"Universe: {len(universe)} stocks "

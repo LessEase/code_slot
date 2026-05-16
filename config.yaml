@@ -22,9 +22,20 @@ universe:
   #                 出口防火墙阻断时使用
   a_share_data_source: "auto"
 
-  # 美股：标普500成分股
+  # ── 美股 ──────────────────────────────────────────────────────
   us_market: true
-  us_stock_list:            # 为空则自动从 Wikipedia 获取标普500列表
+  # 美股 universe 模式：
+  #   "all"  = 全市场（NASDAQ + NYSE/AMEX 全部挂牌证券，来自 NASDAQ Trader
+  #            官方代码文件 nasdaqlisted.txt / otherlisted.txt，约 6000+ 只）
+  #   "list" = 仅用下方 us_stock_list 显式列表
+  us_universe: "all"
+  us_include_etf: true        # "all" 模式是否纳入 ETF（仍排除权证/优先股/单位）
+  us_stock_limit: 0           # 0 = 不限；>0 取前 N 只（按字典序，调试用）
+  us_fetch_workers: 8         # 美股历史下载并发度（yfinance/Yahoo 比较耐并发）
+  us_universe_cache_days: 7   # NASDAQ Trader 代码表本地缓存有效期（天）
+  # us_universe == "list" 时生效；"all" 模式下仅作为 NASDAQ Trader 拉取
+  # 失败时的兜底列表。
+  us_stock_list:
     - AAPL
     - MSFT
     - GOOGL
